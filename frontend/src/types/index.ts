@@ -47,6 +47,10 @@ export interface ChatResponse {
   stage_latencies?: Record<string, number>;
   retry_after?: number | null;
   model?: string;
+  provider?: 'openrouter' | 'ollama';
+  fallback_active?: boolean;
+  fallback_reason?: 'quota_exhausted' | 'provider_outage';
+  fallback_notice?: string | null;
   disclaimer: string;
 }
 
@@ -80,6 +84,10 @@ export interface StreamCitationsPayload {
   data_mode?: 'verified' | 'demonstration' | 'conversational';
   provenance_warning?: string | null;
   model?: string;
+  provider?: 'openrouter' | 'ollama';
+  fallback_active?: boolean;
+  fallback_reason?: 'quota_exhausted' | 'provider_outage';
+  fallback_notice?: string | null;
 }
 
 export interface StreamCompletePayload {
@@ -89,6 +97,10 @@ export interface StreamCompletePayload {
   generation_ms?: number;
   total_tokens?: number;
   model?: string;
+  provider?: 'openrouter' | 'ollama';
+  fallback_active?: boolean;
+  fallback_reason?: 'quota_exhausted' | 'provider_outage';
+  fallback_notice?: string | null;
   grounded?: boolean;
   data_mode?: 'verified' | 'demonstration' | 'conversational';
   provenance_warning?: string | null;

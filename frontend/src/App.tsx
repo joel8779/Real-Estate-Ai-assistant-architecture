@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { AlertTriangle } from 'lucide-react';
 import { Navbar } from './components/Navbar';
 import { ChatContainer } from './components/ChatContainer';
 import { ChatMessage, ChatResponse } from './types';
@@ -14,6 +15,7 @@ export const App: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [sourceFilter, setSourceFilter] = useState<'all' | 'darglobal' | 'wasalt'>('all');
   const [isBackendHealthy, setIsBackendHealthy] = useState<boolean | null>(null);
+  const [activeFallbackNotice, setActiveFallbackNotice] = useState<string | null>(null);
 
   const abortControllerRef = useRef<AbortController | null>(null);
 
@@ -152,6 +154,10 @@ export const App: React.FC = () => {
                   provenance_warning:
                     citationsPayload.provenance_warning ?? existing.provenance_warning,
                   model: citationsPayload.model || existing.model,
+                  provider: citationsPayload.provider || existing.provider,
+                  fallback_active: citationsPayload.fallback_active ?? existing.fallback_active,
+                  fallback_reason: citationsPayload.fallback_reason || existing.fallback_reason,
+                  fallback_notice: citationsPayload.fallback_notice || existing.fallback_notice,
                   error_code: null,
                 },
               };
@@ -161,6 +167,14 @@ export const App: React.FC = () => {
             setIsStreaming(false);
             setIsLoading(false);
             setStreamingStatus(null);
+            if (completePayload.fallback_active && completePayload.fallback_notice) {
+              setActiveFallbackNotice(completePayload.fallback_notice);
+            } else if (
+              completePayload.provider === 'openrouter' ||
+              (!completePayload.fallback_active && completePayload.model?.toLowerCase().includes('nemotron'))
+            ) {
+              setActiveFallbackNotice(null);
+            }
             setResponses((prev) => {
               const existing = prev[assistantIndex];
               if (!existing) return prev;
@@ -175,6 +189,10 @@ export const App: React.FC = () => {
                   latency_ms: completePayload.latency_ms,
                   stage_latencies: completePayload.stage_latencies,
                   model: completePayload.model || existing.model,
+                  provider: completePayload.provider || existing.provider,
+                  fallback_active: completePayload.fallback_active ?? existing.fallback_active,
+                  fallback_reason: completePayload.fallback_reason || existing.fallback_reason,
+                  fallback_notice: completePayload.fallback_notice || existing.fallback_notice,
                   disclaimer: completePayload.disclaimer || existing.disclaimer,
                   error_code: null,
                 },
@@ -354,6 +372,10 @@ export const App: React.FC = () => {
                   provenance_warning:
                     citationsPayload.provenance_warning ?? existing.provenance_warning,
                   model: citationsPayload.model || existing.model,
+                  provider: citationsPayload.provider || existing.provider,
+                  fallback_active: citationsPayload.fallback_active ?? existing.fallback_active,
+                  fallback_reason: citationsPayload.fallback_reason || existing.fallback_reason,
+                  fallback_notice: citationsPayload.fallback_notice || existing.fallback_notice,
                   error_code: null,
                 },
               };
@@ -364,6 +386,14 @@ export const App: React.FC = () => {
             setIsLoading(false);
             setIsRetrying(false);
             setStreamingStatus(null);
+            if (completePayload.fallback_active && completePayload.fallback_notice) {
+              setActiveFallbackNotice(completePayload.fallback_notice);
+            } else if (
+              completePayload.provider === 'openrouter' ||
+              (!completePayload.fallback_active && completePayload.model?.toLowerCase().includes('nemotron'))
+            ) {
+              setActiveFallbackNotice(null);
+            }
             setResponses((prev) => {
               const existing = prev[assistantIndex];
               if (!existing) return prev;
@@ -378,6 +408,10 @@ export const App: React.FC = () => {
                   latency_ms: completePayload.latency_ms,
                   stage_latencies: completePayload.stage_latencies,
                   model: completePayload.model || existing.model,
+                  provider: completePayload.provider || existing.provider,
+                  fallback_active: completePayload.fallback_active ?? existing.fallback_active,
+                  fallback_reason: completePayload.fallback_reason || existing.fallback_reason,
+                  fallback_notice: completePayload.fallback_notice || existing.fallback_notice,
                   disclaimer: completePayload.disclaimer || existing.disclaimer,
                   error_code: null,
                 },
@@ -472,6 +506,7 @@ export const App: React.FC = () => {
     setIsStreaming(false);
     setIsRetrying(false);
     setStreamingStatus(null);
+    setActiveFallbackNotice(null);
   };
 
   return (
@@ -483,6 +518,15 @@ export const App: React.FC = () => {
         onClearChat={handleClearChat}
       />
       <main className="flex-1 min-h-0 flex flex-col overflow-hidden">
+        {activeFallbackNotice && (
+          <div
+            data-testid="fallback-notice-banner"
+            className="bg-amber-500/10 border-b border-amber-500/20 px-4 py-2 text-xs text-amber-300 flex items-center justify-center space-x-2 animate-fadeIn flex-shrink-0"
+          >
+            <AlertTriangle className="w-3.5 h-3.5 text-amber-400 flex-shrink-0" />
+            <span className="font-normal">{activeFallbackNotice}</span>
+          </div>
+        )}
         <ChatContainer
           messages={messages}
           responses={responses}

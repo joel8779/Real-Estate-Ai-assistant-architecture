@@ -1,28 +1,33 @@
-"""Comprehensive Test Suite for Controlled Multi-Model Fallback Routing.
+"""Comprehensive Test Suite for Primary OpenRouter to Secondary Ollama Failover Routing.
 
 Tests:
-1. Model hierarchy & priority order (Primary -> Fallback 1 -> Fallback 2).
-2. Eligible transient failure triggers (model-specific 429, 503, connection timeout).
-3. Ineligible failure blocks (HTTP 401 auth, HTTP 402 quota, HTTP 400 invalid request).
-4. Account-wide quota exhaustion detection (free-models-per-day) halts fallback immediately.
-5. Streaming guardrails (fallback allowed before first token; NEVER fallback mid-stream).
-6. Exact model attribution returned in ChatResponse and SSE events.
-7. RAG validation integrity preserved identically across all models.
+1. Quota Detection: Account-wide free-model daily limit detection.
+2. Primary Success: OpenRouter (Nemotron 3 Ultra) responds successfully; Ollama is never called.
+3. Daily Quota Exhaustion Failover: 429 free-models-per-day triggers immediate failover to Ollama Qwen 2.5 1.5B.
+4. Provider Outage Failover: HTTP 502/503/504 retries once on OpenRouter, then fails over to Ollama.
+5. Network Error Failover: Upstream connection timeout retries once on OpenRouter, then fails over to Ollama.
+6. Permanent Errors Blocked: HTTP 400, 401, 402 do not fail over to Ollama.
+7. Dual Failure: When both OpenRouter and Ollama are unavailable, clear user-friendly error is returned.
+8. Streaming Failover: Pre-token failure fails over cleanly to Ollama streaming.
+9. Streaming Midstream Invariant: Failures AFTER tokens have started streaming never switch providers.
+10. Model Attribution & Transparency Notices: Exact model and notice strings for quota vs outage.
 """
 
-import json
+from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
 import httpx
 import pytest
 
 from backend.app.config import Settings
 from backend.app.core.exceptions import KnowledgeBaseException
+from backend.app.rag.ollama import OllamaClient, OllamaUnavailableError, OllamaTimeoutError
 from backend.app.rag.openrouter import (
     OpenRouterClient,
     OpenRouterAuthError,
     OpenRouterQuotaError,
     OpenRouterRateLimitError,
     OpenRouterServiceError,
+    OpenRouterAccountQuotaExhaustedError,
     is_account_level_quota_exhausted,
 )
 from backend.app.rag.orchestrator import RAGOrchestrator
@@ -30,30 +35,30 @@ from backend.app.rag.retriever import RetrievedItem
 from backend.app.schemas.chat import ChatMessage, ChatRequest
 
 
-# ============================================================================
-# 1. Configuration & Quota Detection Tests
-# ============================================================================
-
-def test_fallback_models_config_semicolon_and_comma():
-    """Verify OPENROUTER_FALLBACK_MODELS parses semicolons and commas."""
-    # Semicolon separated
-    s1 = Settings(OPENROUTER_FALLBACK_MODELS="meta-llama/llama-3.3-70b;mistralai/mistral-7b")
-    assert s1.OPENROUTER_FALLBACK_MODELS == [
-        "meta-llama/llama-3.3-70b",
-        "mistralai/mistral-7b",
+@pytest.fixture
+def sample_evidence() -> List[RetrievedItem]:
+    return [
+        RetrievedItem(
+            chunk_id="chunk_01",
+            entity_id="project_aida",
+            title="AIDA Oman Luxury Community",
+            source="darglobal",
+            category="project",
+            url="https://darglobal.co.uk/projects/aida",
+            provenance="demonstration_unverified",
+            text_content="AIDA is a premier cliffside community in Muscat, Oman featuring Trump International Golf Club.",
+            rrf_score=0.95,
+            semantic_similarity=0.88,
+        )
     ]
 
-    # Comma separated
-    s2 = Settings(OPENROUTER_FALLBACK_MODELS="meta-llama/llama-3.3-70b, mistralai/mistral-7b")
-    assert s2.OPENROUTER_FALLBACK_MODELS == [
-        "meta-llama/llama-3.3-70b",
-        "mistralai/mistral-7b",
-    ]
 
+# ============================================================================
+# 1. Quota Exhaustion Detection Unit Tests
+# ============================================================================
 
 def test_is_account_level_quota_exhausted_detection():
     """Verify detection of account-wide daily limit vs model-specific rate limiting."""
-    # Account-wide quota exhaustion messages
     assert is_account_level_quota_exhausted(
         '{"error": {"message": "Rate limit exceeded: free-models-per-day: 50 requests/day"}}'
     ) is True
@@ -68,68 +73,62 @@ def test_is_account_level_quota_exhausted_detection():
 
 
 # ============================================================================
-# 2. Completion Routing & Priority Tests
+# 2. OpenRouter Client Routing Policy (Locked to Single Model)
 # ============================================================================
 
 @pytest.mark.asyncio
-async def test_fallback_priority_chain_primary_to_fallback2():
-    """Verify routing attempts models strictly in priority order:
-    Primary fails (model-specific 429) -> Fallback 1 fails (503) -> Fallback 2 succeeds (200).
-    """
+async def test_openrouter_client_single_model_success():
+    """Verify OpenRouterClient sends requests strictly to the configured primary model."""
     client = OpenRouterClient(
         api_key="sk-test-key",
         primary_model="nvidia/nemotron-3-ultra-550b-a55b:free",
-        allow_fallback=True,
-        fallback_models=[
-            "meta-llama/llama-3.3-70b-instruct:free",
-            "mistralai/mistral-7b-instruct:free",
-        ],
     )
-
-    resp_429 = MagicMock(spec=httpx.Response)
-    resp_429.status_code = 429
-    resp_429.text = '{"error": {"message": "Model concurrency limit reached"}}'
-    resp_429.headers = {}
-
-    resp_503 = MagicMock(spec=httpx.Response)
-    resp_503.status_code = 503
-    resp_503.text = "Service Unavailable"
 
     resp_200 = MagicMock(spec=httpx.Response)
     resp_200.status_code = 200
     resp_200.json.return_value = {
-        "choices": [{"message": {"role": "assistant", "content": "Grounded answer from Fallback 2"}}],
-        "usage": {"prompt_tokens": 100, "completion_tokens": 25},
+        "choices": [{"message": {"role": "assistant", "content": "Nemotron answer"}}],
+        "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "usage": {"prompt_tokens": 10, "completion_tokens": 5},
     }
 
-    # Primary gets 2x 429; Fallback 1 gets 2x 503; Fallback 2 gets 200
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
-        mock_post.side_effect = [resp_429, resp_429, resp_503, resp_503, resp_200]
-        with patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await client.generate_completion([{"role": "user", "content": "Tell me about AIDA"}])
+        mock_post.return_value = resp_200
+        result = await client.generate_completion([{"role": "user", "content": "Hello"}])
 
-            assert result["content"] == "Grounded answer from Fallback 2"
-            assert result["model"] == "mistralai/mistral-7b-instruct:free"
-
-            # Check models requested in chronological order
-            models_called = [call.kwargs["json"]["model"] for call in mock_post.call_args_list]
-            assert models_called == [
-                "nvidia/nemotron-3-ultra-550b-a55b:free",
-                "nvidia/nemotron-3-ultra-550b-a55b:free",
-                "meta-llama/llama-3.3-70b-instruct:free",
-                "meta-llama/llama-3.3-70b-instruct:free",
-                "mistralai/mistral-7b-instruct:free",
-            ]
+        assert result["content"] == "Nemotron answer"
+        assert result["model"] == "nvidia/nemotron-3-ultra-550b-a55b:free"
+        assert mock_post.call_count == 1
+        assert mock_post.call_args_list[0].kwargs["json"]["model"] == "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 
 @pytest.mark.asyncio
-async def test_all_models_fail_raises_service_error():
-    """Verify OpenRouterServiceError is raised when all candidate models fail."""
+async def test_openrouter_account_quota_exhausted_raises_immediately():
+    """Account-wide quota exhaustion on OpenRouter raises immediately without retrying."""
     client = OpenRouterClient(
         api_key="sk-test-key",
         primary_model="nvidia/nemotron-3-ultra-550b-a55b:free",
-        allow_fallback=True,
-        fallback_models=["meta-llama/llama-3.3-70b-instruct:free"],
+    )
+
+    resp_429 = MagicMock(spec=httpx.Response)
+    resp_429.status_code = 429
+    resp_429.text = '{"error": {"message": "Rate limit exceeded: free-models-per-day: 50 requests/day"}}'
+    resp_429.headers = {"Retry-After": "3600"}
+
+    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = resp_429
+        with pytest.raises(OpenRouterAccountQuotaExhaustedError):
+            await client.generate_completion([{"role": "user", "content": "Hello"}])
+
+        assert mock_post.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_openrouter_service_outage_retries_once():
+    """Upstream 503 retries once with backoff then raises OpenRouterServiceError."""
+    client = OpenRouterClient(
+        api_key="sk-test-key",
+        primary_model="nvidia/nemotron-3-ultra-550b-a55b:free",
     )
 
     resp_503 = MagicMock(spec=httpx.Response)
@@ -138,249 +137,312 @@ async def test_all_models_fail_raises_service_error():
 
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
         mock_post.return_value = resp_503
-        with patch("asyncio.sleep", new_callable=AsyncMock):
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
             with pytest.raises(OpenRouterServiceError):
                 await client.generate_completion([{"role": "user", "content": "Hello"}])
 
-
-# ============================================================================
-# 3. Ineligible Failure Tests (No Fallback Allowed)
-# ============================================================================
-
-@pytest.mark.asyncio
-async def test_account_wide_quota_blocks_fallback():
-    """Verify that account-wide 429 quota exhaustion (50 req/day) halts immediately without trying fallback."""
-    client = OpenRouterClient(
-        api_key="sk-test-key",
-        primary_model="nvidia/nemotron-3-ultra-550b-a55b:free",
-        allow_fallback=True,
-        fallback_models=["meta-llama/llama-3.3-70b-instruct:free"],
-    )
-
-    resp_account_429 = MagicMock(spec=httpx.Response)
-    resp_account_429.status_code = 429
-    resp_account_429.text = '{"error": {"message": "Rate limit exceeded: free-models-per-day: 50 requests/day"}}'
-    resp_account_429.headers = {"Retry-After": "3600"}
-
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
-        mock_post.return_value = resp_account_429
-        with pytest.raises(OpenRouterRateLimitError):
-            await client.generate_completion([{"role": "user", "content": "Hello"}])
-
-        # Assert client stopped immediately after detecting account-wide quota
-        assert mock_post.call_count == 1
-        assert mock_post.call_args_list[0].kwargs["json"]["model"] == "nvidia/nemotron-3-ultra-550b-a55b:free"
+            assert mock_post.call_count == 2
+            assert mock_sleep.call_count == 1
 
 
 @pytest.mark.asyncio
-async def test_http_401_auth_error_no_fallback():
-    """Verify HTTP 401 raises OpenRouterAuthError without trying fallback."""
-    client = OpenRouterClient(
-        api_key="invalid-key",
-        primary_model="nvidia/nemotron-3-ultra-550b-a55b:free",
-        allow_fallback=True,
-        fallback_models=["meta-llama/llama-3.3-70b-instruct:free"],
-    )
+async def test_openrouter_permanent_errors_never_retry():
+    """HTTP 400, 401, 402 raise immediately without retrying."""
+    client = OpenRouterClient(api_key="sk-test-key")
 
-    resp_401 = MagicMock(spec=httpx.Response)
-    resp_401.status_code = 401
-    resp_401.text = "Unauthorized"
+    for status_code, expected_exc in [
+        (400, KnowledgeBaseException),
+        (401, OpenRouterAuthError),
+        (402, OpenRouterQuotaError),
+    ]:
+        resp = MagicMock(spec=httpx.Response)
+        resp.status_code = status_code
+        resp.text = f"Error {status_code}"
 
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
-        mock_post.return_value = resp_401
-        with pytest.raises(OpenRouterAuthError):
-            await client.generate_completion([{"role": "user", "content": "Hello"}])
-
-        assert mock_post.call_count == 1
-
-
-@pytest.mark.asyncio
-async def test_http_400_invalid_request_no_fallback():
-    """Verify HTTP 400 invalid request raises KnowledgeBaseException without trying fallback."""
-    client = OpenRouterClient(
-        api_key="sk-test-key",
-        primary_model="nvidia/nemotron-3-ultra-550b-a55b:free",
-        allow_fallback=True,
-        fallback_models=["meta-llama/llama-3.3-70b-instruct:free"],
-    )
-
-    resp_400 = MagicMock(spec=httpx.Response)
-    resp_400.status_code = 400
-    resp_400.text = "Invalid parameter payload"
-
-    with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
-        mock_post.return_value = resp_400
-        with pytest.raises(KnowledgeBaseException) as exc_info:
-            await client.generate_completion([{"role": "user", "content": "Hello"}])
-
-        assert exc_info.value.code == "LLM_INVALID_REQUEST"
-        assert mock_post.call_count == 1
+        with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = resp
+            with pytest.raises(expected_exc):
+                await client.generate_completion([{"role": "user", "content": "Hello"}])
+            assert mock_post.call_count == 1
 
 
 # ============================================================================
-# 4. Streaming Guardrail Tests
+# 3. End-to-End Orchestrator Non-Streaming Failover Tests
 # ============================================================================
 
 @pytest.mark.asyncio
-async def test_streaming_fallback_before_first_token():
-    """Verify that if primary fails with 503 before emitting any token, fallback model is used."""
-    client = OpenRouterClient(
-        api_key="sk-test-key",
-        primary_model="nvidia/nemotron-3-ultra-550b-a55b:free",
-        allow_fallback=True,
-        fallback_models=["meta-llama/llama-3.3-70b-instruct:free"],
-    )
-
-    # Primary stream returns 503
-    resp_503 = MagicMock()
-    resp_503.status_code = 503
-    resp_503.aread = AsyncMock(return_value=b"Service Unavailable")
-
-    # Fallback stream returns 200 with tokens
-    async def aiter_fallback():
-        yield 'data: {"choices": [{"delta": {"content": "Fallback stream token"}}]}'
-        yield "data: [DONE]"
-
-    resp_200 = MagicMock()
-    resp_200.status_code = 200
-    resp_200.aiter_lines = aiter_fallback
-
-    class MockStreamContext:
-        def __init__(self, response):
-            self.response = response
-
-        async def __aenter__(self):
-            return self.response
-
-        async def __aexit__(self, exc_type, exc_val, exc_tb):
-            pass
-
-    with patch("httpx.AsyncClient.stream") as mock_stream:
-        # Primary gets 2x 503, fallback gets 200
-        mock_stream.side_effect = [
-            MockStreamContext(resp_503),
-            MockStreamContext(resp_503),
-            MockStreamContext(resp_200),
-        ]
-        with patch("asyncio.sleep", new_callable=AsyncMock):
-            chunks = []
-            async for chunk in client.stream_completion([{"role": "user", "content": "Hello"}]):
-                chunks.append(chunk)
-
-            tokens = [c["token"] for c in chunks if c["type"] == "token"]
-            assert tokens == ["Fallback stream token"]
-            done_chunk = next(c for c in chunks if c["type"] == "done")
-            assert done_chunk["model"] == "meta-llama/llama-3.3-70b-instruct:free"
-
-
-@pytest.mark.asyncio
-async def test_streaming_no_fallback_after_tokens_started():
-    """Verify that if a model fails AFTER tokens have started streaming,
-    client NEVER falls back or concatenates another model; it raises immediately.
-    """
-    client = OpenRouterClient(
-        api_key="sk-test-key",
-        primary_model="nvidia/nemotron-3-ultra-550b-a55b:free",
-        allow_fallback=True,
-        fallback_models=["meta-llama/llama-3.3-70b-instruct:free"],
-    )
-
-    async def aiter_broken_stream():
-        yield 'data: {"choices": [{"delta": {"content": "Initial primary token"}}]}'
-        # Network breaks mid-stream
-        raise httpx.NetworkError("Connection lost mid-response")
-
-    resp_broken = MagicMock()
-    resp_broken.status_code = 200
-    resp_broken.aiter_lines = aiter_broken_stream
-
-    class MockStreamContext:
-        async def __aenter__(self):
-            return resp_broken
-
-        async def __aexit__(self, exc_type, exc_val, exc_tb):
-            pass
-
-    with patch("httpx.AsyncClient.stream") as mock_stream:
-        mock_stream.return_value = MockStreamContext()
-        chunks = []
-        with pytest.raises(OpenRouterServiceError) as exc_info:
-            async for chunk in client.stream_completion([{"role": "user", "content": "Hello"}]):
-                chunks.append(chunk)
-
-        # Emitted 1 token before breaking
-        assert len(chunks) == 1
-        assert chunks[0]["token"] == "Initial primary token"
-        assert "interrupted" in str(exc_info.value).lower()
-        # Verify mock_stream was called only once (never called fallback model!)
-        assert mock_stream.call_count == 1
-
-
-# ============================================================================
-# 5. End-to-End Orchestrator Model Attribution Tests
-# ============================================================================
-
-@pytest.mark.asyncio
-async def test_orchestrator_returns_exact_model_attribution():
-    """Verify orchestrator reports fallback model in ChatResponse and stream events."""
+async def test_orchestrator_primary_success(sample_evidence):
+    """When OpenRouter succeeds, Ollama is never called and response shows OpenRouter provider."""
     mock_retriever = MagicMock()
-    mock_retriever.aretrieve = AsyncMock(
-        return_value=(
-            [
-                RetrievedItem(
-                    chunk_id="test_chunk_1",
-                    entity_id="test_entity_1",
-                    doc_id="test_doc_1",
-                    source="darglobal",
-                    category="project",
-                    title="AIDA Development",
-                    url="https://darglobal.co.uk/aida",
-                    text_content="AIDA is located in Muscat, Oman.",
-                    provenance="recruiter_provided",
-                    semantic_similarity=0.92,
-                )
-            ],
-            {"embedding_ms": 5.0, "vector_search_ms": 10.0, "bm25_search_ms": 4.0, "rrf_fusion_ms": 1.0, "total_retrieval_ms": 20.0},
-        )
+    mock_retriever.retrieve.return_value = sample_evidence
+
+    mock_openrouter = MagicMock()
+    mock_openrouter.primary_model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    mock_openrouter.generate_completion = AsyncMock(return_value={
+        "content": "AIDA in Oman features stunning cliffs and Trump International Golf Club.",
+        "model": "nvidia/nemotron-3-ultra-550b-a55b:free",
+        "dispatch_ms": 10.0,
+        "generation_ms": 25.0,
+    })
+
+    mock_ollama = MagicMock()
+    mock_ollama.generate_completion = AsyncMock()
+
+    orchestrator = RAGOrchestrator(
+        retriever=mock_retriever,
+        llm_client=mock_openrouter,
+        ollama_client=mock_ollama,
     )
 
-    # OpenRouter returns fallback model
-    mock_llm_client = MagicMock()
-    mock_llm_client.primary_model = "nvidia/nemotron-3-ultra-550b-a55b:free"
-    mock_llm_client.generate_completion = AsyncMock(
-        return_value={
-            "content": "AIDA is a luxury development in Muscat, Oman.",
-            "model": "meta-llama/llama-3.3-70b-instruct:free",
-            "dispatch_ms": 10.0,
-            "generation_ms": 200.0,
-        }
+    req = ChatRequest(messages=[ChatMessage(role="user", content="Tell me about AIDA Oman")])
+    resp = await orchestrator.answer_question(req)
+
+    assert resp.provider == "openrouter"
+    assert resp.fallback_active is False
+    assert resp.fallback_reason is None
+    assert resp.fallback_notice is None
+    assert "nvidia/nemotron-3-ultra-550b-a55b:free" in resp.model
+    mock_ollama.generate_completion.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_failover_on_account_quota_exhaustion(sample_evidence):
+    """When OpenRouter raises OpenRouterAccountQuotaExhaustedError, orchestrator fails over to Ollama."""
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = sample_evidence
+
+    mock_openrouter = MagicMock()
+    mock_openrouter.primary_model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    mock_openrouter.generate_completion = AsyncMock(
+        side_effect=OpenRouterAccountQuotaExhaustedError("Rate limit exceeded: free-models-per-day: 50 requests/day")
     )
 
-    orchestrator = RAGOrchestrator(retriever=mock_retriever, llm_client=mock_llm_client)
+    mock_ollama = MagicMock()
+    mock_ollama.generate_completion = AsyncMock(return_value={
+        "content": "AIDA is a premier development in Oman with a golf club.",
+        "model": "qwen2.5:1.5b",
+        "dispatch_ms": 5.0,
+        "generation_ms": 15.0,
+    })
 
-    request = ChatRequest(
-        messages=[ChatMessage(role="user", content="Where is AIDA located?")],
-        source_filter="darglobal",
+    orchestrator = RAGOrchestrator(
+        retriever=mock_retriever,
+        llm_client=mock_openrouter,
+        ollama_client=mock_ollama,
     )
 
-    # 1. Non-streaming ChatResponse
-    response = await orchestrator.answer_question(request)
-    assert response.model == "meta-llama/llama-3.3-70b-instruct:free"
-    assert len(response.citations) > 0
+    req = ChatRequest(messages=[ChatMessage(role="user", content="Tell me about AIDA Oman")])
+    resp = await orchestrator.answer_question(req)
 
-    # 2. Streaming SSE events
-    async def mock_stream(*args, **kwargs):
-        yield {"type": "token", "token": "AIDA is in Muscat, Oman."}
-        yield {"type": "done", "model": "meta-llama/llama-3.3-70b-instruct:free"}
+    assert resp.provider == "ollama"
+    assert resp.fallback_active is True
+    assert resp.fallback_reason == "quota_exhausted"
+    assert "daily free-model request limit" in resp.fallback_notice
+    assert resp.model == "ollama/qwen2.5:1.5b"
+    assert "AIDA is a premier development" in resp.answer
+    mock_ollama.generate_completion.assert_called_once()
 
-    mock_llm_client.stream_completion = mock_stream
 
+@pytest.mark.asyncio
+async def test_orchestrator_failover_on_provider_outage(sample_evidence):
+    """When OpenRouter raises OpenRouterServiceError (503), orchestrator fails over to Ollama."""
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = sample_evidence
+
+    mock_openrouter = MagicMock()
+    mock_openrouter.primary_model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    mock_openrouter.generate_completion = AsyncMock(
+        side_effect=OpenRouterServiceError("OpenRouter error 503: Service Unavailable")
+    )
+
+    mock_ollama = MagicMock()
+    mock_ollama.generate_completion = AsyncMock(return_value={
+        "content": "AIDA in Oman features luxury residences.",
+        "model": "qwen2.5:1.5b",
+        "dispatch_ms": 5.0,
+        "generation_ms": 12.0,
+    })
+
+    orchestrator = RAGOrchestrator(
+        retriever=mock_retriever,
+        llm_client=mock_openrouter,
+        ollama_client=mock_ollama,
+    )
+
+    req = ChatRequest(messages=[ChatMessage(role="user", content="Tell me about AIDA Oman")])
+    resp = await orchestrator.answer_question(req)
+
+    assert resp.provider == "ollama"
+    assert resp.fallback_active is True
+    assert resp.fallback_reason == "provider_outage"
+    assert "temporarily unavailable" in resp.fallback_notice
+    assert resp.model == "ollama/qwen2.5:1.5b"
+    mock_ollama.generate_completion.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_permanent_error_blocks_failover(sample_evidence):
+    """When OpenRouter raises OpenRouterAuthError (401), orchestrator does NOT fail over to Ollama."""
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = sample_evidence
+
+    mock_openrouter = MagicMock()
+    mock_openrouter.primary_model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    mock_openrouter.generate_completion = AsyncMock(
+        side_effect=OpenRouterAuthError("Invalid API key")
+    )
+
+    mock_ollama = MagicMock()
+    mock_ollama.generate_completion = AsyncMock()
+
+    orchestrator = RAGOrchestrator(
+        retriever=mock_retriever,
+        llm_client=mock_openrouter,
+        ollama_client=mock_ollama,
+    )
+
+    req = ChatRequest(messages=[ChatMessage(role="user", content="Tell me about AIDA Oman")])
+    resp = await orchestrator.answer_question(req)
+
+    assert resp.error_code == "LLM_AUTH_ERROR"
+    assert resp.provider == "openrouter"
+    assert resp.fallback_active is False
+    mock_ollama.generate_completion.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_dual_failure_returns_graceful_error(sample_evidence):
+    """When OpenRouter is exhausted and Ollama is unreachable, returns clear error response without crashing."""
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = sample_evidence
+
+    mock_openrouter = MagicMock()
+    mock_openrouter.primary_model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    mock_openrouter.generate_completion = AsyncMock(
+        side_effect=OpenRouterAccountQuotaExhaustedError("Rate limit exceeded: free-models-per-day: 50 requests/day")
+    )
+
+    mock_ollama = MagicMock()
+    mock_ollama.generate_completion = AsyncMock(
+        side_effect=OllamaUnavailableError("Failed to connect to Ollama")
+    )
+
+    orchestrator = RAGOrchestrator(
+        retriever=mock_retriever,
+        llm_client=mock_openrouter,
+        ollama_client=mock_ollama,
+    )
+
+    req = ChatRequest(messages=[ChatMessage(role="user", content="Tell me about AIDA Oman")])
+    resp = await orchestrator.answer_question(req)
+
+    assert resp.error_code == "LLM_SERVICE_UNAVAILABLE"
+    assert "Additionally, local fallback to Qwen via Ollama failed" in resp.answer
+    assert resp.citations == []
+    assert resp.property_cards == []
+
+
+# ============================================================================
+# 4. Streaming Failover & Mid-stream Invariant Tests
+# ============================================================================
+
+@pytest.mark.asyncio
+async def test_streaming_failover_before_first_token(sample_evidence):
+    """If OpenRouter fails before any token is emitted, stream fails over cleanly to Ollama."""
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = sample_evidence
+
+    async def failing_openrouter_stream(*args, **kwargs):
+        raise OpenRouterAccountQuotaExhaustedError("Rate limit exceeded: free-models-per-day: 50 requests/day")
+        yield  # Make it an async generator
+
+    async def successful_ollama_stream(*args, **kwargs):
+        yield {"type": "token", "token": "AIDA "}
+        yield {"type": "token", "token": "cliffside "}
+        yield {"type": "token", "token": "villas."}
+
+    mock_openrouter = MagicMock()
+    mock_openrouter.primary_model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    mock_openrouter.stream_completion = failing_openrouter_stream
+
+    mock_ollama = MagicMock()
+    mock_ollama.stream_completion = successful_ollama_stream
+
+    orchestrator = RAGOrchestrator(
+        retriever=mock_retriever,
+        llm_client=mock_openrouter,
+        ollama_client=mock_ollama,
+    )
+
+    req = ChatRequest(messages=[ChatMessage(role="user", content="Tell me about AIDA Oman")])
     events = []
-    async for event in orchestrator.stream_answer_question(request):
+    async for event in orchestrator.stream_answer_question(req):
         events.append(event)
 
-    citations_event = next(e for e in events if e["event"] == "citations")
-    assert citations_event["data"]["model"] == "meta-llama/llama-3.3-70b-instruct:free"
+    event_types = [e["event"] for e in events]
+    assert "status" in event_types
+    assert "token" in event_types
+    assert "citations" in event_types
+    assert "complete" in event_types
 
-    complete_event = next(e for e in events if e["event"] == "complete")
-    assert complete_event["data"]["model"] == "meta-llama/llama-3.3-70b-instruct:free"
+    # Verify fallback notice was emitted in status
+    fallback_statuses = [
+        e["data"]["message"] for e in events
+        if e["event"] == "status" and "Routing to local Qwen" in e["data"].get("message", "")
+    ]
+    assert len(fallback_statuses) > 0
+
+    # Verify tokens came through
+    tokens = [e["data"]["token"] for e in events if e["event"] == "token"]
+    assert "".join(tokens) == "AIDA cliffside villas."
+
+    # Verify complete event has ollama attribution and fallback metadata
+    complete_event = [e for e in events if e["event"] == "complete"][0]
+    assert complete_event["data"]["provider"] == "ollama"
+    assert complete_event["data"]["fallback_active"] is True
+    assert complete_event["data"]["fallback_reason"] == "quota_exhausted"
+    assert "daily free-model request limit" in complete_event["data"]["fallback_notice"]
+
+
+@pytest.mark.asyncio
+async def test_streaming_never_failover_midstream(sample_evidence):
+    """If OpenRouter fails AFTER emitting tokens, orchestrator NEVER fails over to Ollama.
+    It terminates with an error event to prevent concatenating another model mid-sentence.
+    """
+    mock_retriever = MagicMock()
+    mock_retriever.retrieve.return_value = sample_evidence
+
+    async def openrouter_midstream_crash(*args, **kwargs):
+        yield {"type": "token", "token": "AIDA is located on"}
+        # Drop connection midstream
+        raise OpenRouterServiceError("Stream interrupted: connection reset by peer")
+
+    mock_ollama = MagicMock()
+    mock_ollama.stream_completion = AsyncMock()
+
+    mock_openrouter = MagicMock()
+    mock_openrouter.primary_model = "nvidia/nemotron-3-ultra-550b-a55b:free"
+    mock_openrouter.stream_completion = openrouter_midstream_crash
+
+    orchestrator = RAGOrchestrator(
+        retriever=mock_retriever,
+        llm_client=mock_openrouter,
+        ollama_client=mock_ollama,
+    )
+
+    req = ChatRequest(messages=[ChatMessage(role="user", content="Tell me about AIDA Oman")])
+    events = []
+    async for event in orchestrator.stream_answer_question(req):
+        events.append(event)
+
+    # Assert tokens were received
+    tokens = [e["data"]["token"] for e in events if e["event"] == "token"]
+    assert "AIDA is located on" in tokens
+
+    # Assert error event was emitted instead of failing over to Ollama
+    error_events = [e for e in events if e["event"] == "error"]
+    assert len(error_events) == 1
+    assert error_events[0]["data"]["error_code"] == "LLM_SERVICE_UNAVAILABLE"
+
+    # Crucial: Ollama was NEVER called mid-stream
+    mock_ollama.stream_completion.assert_not_called()

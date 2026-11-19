@@ -20,6 +20,7 @@ from backend.app.rag.openrouter import (
     OpenRouterAuthError,
     OpenRouterQuotaError,
     OpenRouterServiceError,
+    OpenRouterAccountQuotaExhaustedError,
 )
 from backend.app.rag.prompt import (
     build_evidence_context,
@@ -155,46 +156,32 @@ async def test_openrouter_402_quota_error():
 
 
 @pytest.mark.asyncio
-async def test_openrouter_model_fallback_on_429():
-    """Verify client tries fallback model when primary model returns 429."""
+async def test_openrouter_account_quota_exhausted():
+    """Verify client raises OpenRouterAccountQuotaExhaustedError on account daily quota limit."""
     client = OpenRouterClient(
         api_key="valid-key",
-        primary_model="primary/model:free",
-        allow_fallback=True,
-        fallback_models=["fallback/model:free"],
+        primary_model="nvidia/nemotron-3-ultra-550b-a55b:free",
     )
 
     resp_429 = MagicMock(spec=httpx.Response)
     resp_429.status_code = 429
-    resp_429.text = "Rate limited"
-    resp_429.headers = {}
+    resp_429.text = '{"error": {"message": "Rate limit exceeded: free-models-per-day: 50 requests/day"}}'
+    resp_429.headers = {"Retry-After": "3600"}
 
-    resp_200 = MagicMock(spec=httpx.Response)
-    resp_200.status_code = 200
-    resp_200.json.return_value = {
-        "choices": [{"message": {"content": "Fallback answer"}}],
-        "usage": {"prompt_tokens": 50, "completion_tokens": 10},
-    }
-
-    # First model gets 429 twice; fallback gets 200
     with patch("httpx.AsyncClient.post", new_callable=AsyncMock) as mock_post:
-        mock_post.side_effect = [resp_429, resp_429, resp_200]
-        with patch("asyncio.sleep", new_callable=AsyncMock):
-            result = await client.generate_completion([{"role": "user", "content": "Hi"}])
-            assert result["content"] == "Fallback answer"
-            assert result["model"] == "fallback/model:free"
+        mock_post.return_value = resp_429
+        with pytest.raises(OpenRouterAccountQuotaExhaustedError):
+            await client.generate_completion([{"role": "user", "content": "Hi"}])
+        assert mock_post.call_count == 1
 
 
 @pytest.mark.asyncio
 async def test_openrouter_model_locked_no_fallback_by_default():
-    """Verify that by default fallback is disabled and OpenRouterServiceError is raised when primary fails."""
+    """Verify OpenRouter only attempts primary model, retrying once on transient 503 before raising."""
     client = OpenRouterClient(
         api_key="valid-key",
         primary_model="nvidia/nemotron-3-ultra-550b-a55b:free",
-        fallback_models=["fallback/model:free"],
-        allow_fallback=False,
     )
-    assert client.allow_fallback is False
 
     resp_503 = MagicMock(spec=httpx.Response)
     resp_503.status_code = 503
@@ -205,7 +192,7 @@ async def test_openrouter_model_locked_no_fallback_by_default():
         with patch("asyncio.sleep", new_callable=AsyncMock):
             with pytest.raises(OpenRouterServiceError):
                 await client.generate_completion([{"role": "user", "content": "Hello"}])
-            # Assert only primary model was attempted (2 retries max), never fallback
+            # Assert only primary model was attempted with 1 retry (2 total attempts)
             assert mock_post.call_count == 2
             for call in mock_post.call_args_list:
                 assert call.kwargs["json"]["model"] == "nvidia/nemotron-3-ultra-550b-a55b:free"

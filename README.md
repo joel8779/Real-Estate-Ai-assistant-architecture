@@ -109,6 +109,30 @@ docker compose logs -f
 - **Liveness Probe**: [http://localhost:8000/healthz](http://localhost:8000/healthz)
 - **Readiness Probe**: [http://localhost:8000/readyz](http://localhost:8000/readyz)
 
+#### Ollama Secondary Fallback Deployment (Qwen 2.5)
+
+Ollama runs as an internal Docker Compose service (`darglobal-ollama`) attached to the private `darglobal-net` network.
+
+- **Primary Provider**: OpenRouter remains the primary provider locked strictly to `nvidia/nemotron-3-ultra-550b-a55b:free`.
+- **Secondary Fallback**: Ollama is used exclusively as a fallback if OpenRouter encounters account-wide daily free-model quota exhaustion (`free-models-per-day` 429) or upstream provider outages (502/503/504).
+- **Fallback Model**: `qwen2.5:1.5b`.
+
+After starting the Docker Compose services, download and verify the model:
+
+```bash
+# 1. Download the fallback model inside the running Ollama container
+docker compose exec ollama ollama pull qwen2.5:1.5b
+
+# 2. Verify the model is installed
+docker compose exec ollama ollama list
+```
+
+> [!NOTE]
+> **Persistent Volume & Security**:
+> - Model weights are stored in the persistent named Docker volume `ollama_data` (mounted at `/root/.ollama`) and are preserved across container updates and restarts.
+> - Model weight directories and binary artifacts (`ollama_data/`, `.ollama/`, `*.gguf`, `*.bin`) are strictly excluded via `.gitignore` and are **not committed to GitHub**.
+> - Port `11434` is not publicly exposed to the host; it is accessible only internally to the backend service via `http://ollama:11434`.
+
 ---
 
 ### 3. Local Development (Without Docker)
@@ -251,11 +275,14 @@ API Response (`/api/v1/chat`)   ──> Grounded answer + original citations + p
 # OpenRouter API Key (Required for live AI synthesis; raises LLM_NOT_CONFIGURED error if absent)
 OPENROUTER_API_KEY=your_key_here
 
-# Primary Model
+# Primary Model (Locked to NVIDIA Nemotron 3 Ultra)
 OPENROUTER_MODEL=nvidia/nemotron-3-ultra-550b-a55b:free
 
-# Fallback Models (tried sequentially if primary returns 429, 5xx, or timeouts)
-OPENROUTER_FALLBACK_MODELS=google/gemini-2.0-flash-exp:free,mistralai/mistral-small-3.1-instruct:free
+# Ollama Secondary Fallback LLM Configuration (Local or Azure)
+OLLAMA_ENABLED=true
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:1.5b
+OLLAMA_TIMEOUT_SECONDS=60.0
 
 # Provenance Data Mode Safeguard
 # false: Strict verified mode (rejects unverified demonstration records; explains lack of verified data)
@@ -332,9 +359,10 @@ py -3.11 scripts/verify_browser_ui.py
 
 ### 5. Docker Compose Configuration & Verification
 The container orchestration is defined in `docker-compose.yml`:
-- **Backend Service**: Multi-stage Python 3.11 build running as non-root `appuser` (UID 10001) with internal `/healthz` healthchecks and persistent volume mount `./data:/app/data`.
-- **Frontend Service**: Multi-stage Node/Vite build served by unprivileged Nginx (UID 101) with internal HTTP healthchecks on port 80.
-- **Internal Network**: Isolated bridge network `app-network`.
+- **Backend Service**: Multi-stage Python 3.11 build running as non-root `appuser` (UID 10001) with internal `/healthz` healthchecks, `OLLAMA_BASE_URL=http://ollama:11434`, and persistent volume mount `./data:/app/data`.
+- **Ollama Service**: Local fallback inference engine running `qwen2.5:1.5b` with persistent volume mount `ollama_data:/root/.ollama` (internal port 11434, unexposed to host).
+- **Frontend Service**: Multi-stage Node/Vite build served by unprivileged Nginx (UID 101) with internal HTTP healthchecks on port 8080.
+- **Internal Network**: Isolated bridge network `darglobal-net`.
 
 ```bash
 # Validate Docker Compose syntax and service definitions

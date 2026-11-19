@@ -2,7 +2,8 @@
 
 Orchestrates input validation, conversational query contextualization, hybrid retrieval,
 provenance assessment (verified vs demonstration mode), context fence construction,
-OpenRouter LLM inference, numerical response validation, and citation assembly.
+primary OpenRouter LLM inference (NVIDIA Nemotron 3 Ultra), secondary Ollama failover
+(Qwen 2.5 1.5B Instruct), numerical response validation, and citation assembly.
 """
 
 import time
@@ -16,7 +17,14 @@ from backend.app.rag.openrouter import (
     OpenRouterClient,
     LLMNotConfiguredException,
     OpenRouterRateLimitError,
+    OpenRouterAccountQuotaExhaustedError,
+    OpenRouterServiceError,
     KnowledgeBaseException,
+)
+from backend.app.rag.ollama import (
+    OllamaClient,
+    OllamaUnavailableError,
+    OllamaTimeoutError,
 )
 from backend.app.rag.intent import classify_intent, UserIntent
 from backend.app.rag.prompt import (
@@ -39,9 +47,18 @@ class RAGOrchestrator:
         self,
         retriever: HybridRetriever,
         llm_client: Optional[OpenRouterClient] = None,
+        ollama_client: Optional[OllamaClient] = None,
     ):
         self.retriever = retriever
         self.llm_client = llm_client or OpenRouterClient()
+        self.ollama_client = ollama_client or OllamaClient()
+
+    @property
+    def primary_model_name(self) -> str:
+        pm = getattr(self.llm_client, "primary_model", None)
+        if isinstance(pm, str) and pm:
+            return pm
+        return "nvidia/nemotron-3-ultra-550b-a55b:free"
 
     async def answer_question(self, payload: ChatRequest) -> ChatResponse:
         """Execute end-to-end conversational RAG pipeline."""
@@ -80,6 +97,10 @@ class RAGOrchestrator:
                 data_mode="conversational",
                 provenance_warning=None,
                 model=None,
+                provider="openrouter",
+                fallback_active=False,
+                fallback_reason=None,
+                fallback_notice=None,
                 request_id=request_id,
                 latency_ms=total_ms,
                 stage_latencies={
@@ -147,7 +168,6 @@ class RAGOrchestrator:
         provenance_warning: Optional[str] = None
 
         if not allow_demo_data:
-            # Verified mode: filter out any demonstration_unverified records
             verified_items = [
                 item for item in retrieved_items
                 if item.provenance in ("verified_source", "recruiter_provided")
@@ -169,12 +189,26 @@ class RAGOrchestrator:
                     grounded=False,
                     data_mode="verified",
                     provenance_warning=None,
+                    model=self.primary_model_name,
+                    provider="openrouter",
+                    fallback_active=False,
                     request_id=request_id,
                     latency_ms=round((time.perf_counter() - start_time) * 1000, 2),
+                    stage_latencies={
+                        "1_request_received": True,
+                        "2_preprocessing_ms": stage_2_preprocessing_ms,
+                        "3_embedding_ms": stage_3_embedding_ms,
+                        "4_vector_search_ms": stage_4_vector_search_ms,
+                        "5_bm25_search_ms": stage_5_bm25_search_ms,
+                        "6_rrf_fusion_ms": stage_6_rrf_fusion_ms,
+                        "7_context_construction_ms": 0.0,
+                        "8_llm_dispatch_ms": 0.0,
+                        "9_llm_generation_ms": 0.0,
+                        "10_total_end_to_end_ms": round((time.perf_counter() - start_time) * 1000, 2),
+                    },
                 )
             retrieved_items = verified_items
         else:
-            # Demonstration mode enabled
             has_unverified = any(item.provenance == "demonstration_unverified" for item in retrieved_items)
             if has_unverified:
                 data_mode = "demonstration"
@@ -186,6 +220,7 @@ class RAGOrchestrator:
 
         # 5. Evidence Sufficiency & Similarity Cutoff
         if not retrieved_items:
+            logger.info(f"RAG Retrieval Empty [{request_id}]: No chunks found.")
             total_ms = round((time.perf_counter() - start_time) * 1000, 2)
             return ChatResponse(
                 answer=(
@@ -198,6 +233,9 @@ class RAGOrchestrator:
                 grounded=False,
                 data_mode=data_mode,
                 provenance_warning=provenance_warning,
+                model=self.primary_model_name,
+                provider="openrouter",
+                fallback_active=False,
                 request_id=request_id,
                 latency_ms=total_ms,
             )
@@ -208,7 +246,6 @@ class RAGOrchestrator:
             else 0.5
         )
 
-        # Check if top match is too low to be considered reliable
         if top_similarity < settings.SIMILARITY_THRESHOLD and retrieved_items[0].bm25_score is None:
             logger.info(
                 f"RAG Low Confidence [{request_id}]: Top similarity {top_similarity:.3f} "
@@ -226,6 +263,9 @@ class RAGOrchestrator:
                 grounded=False,
                 data_mode=data_mode,
                 provenance_warning=provenance_warning,
+                model=self.primary_model_name,
+                provider="openrouter",
+                fallback_active=False,
                 request_id=request_id,
                 latency_ms=total_ms,
             )
@@ -240,17 +280,112 @@ class RAGOrchestrator:
         )
         stage_7_context_construction_ms = round((time.perf_counter() - t_ctx_start) * 1000.0, 2)
 
-        # 8-9. OpenRouter API Request & LLM Generation
+        # 8-9. LLM Request & Fallback Management
         stage_8_llm_dispatch_ms = 0.0
         stage_9_llm_generation_ms = 0.0
+        model_used = self.primary_model_name
+        provider = "openrouter"
+        fallback_active = False
+        fallback_reason = None
+        fallback_notice = None
+        error_code = None
 
         try:
             llm_result = await self.llm_client.generate_completion(llm_messages, request_id=request_id)
             answer_text = llm_result["content"].strip()
-            model_used = llm_result.get("model", self.llm_client.primary_model)
+            model_used = llm_result.get("model", self.primary_model_name)
             stage_8_llm_dispatch_ms = llm_result.get("dispatch_ms", 0.0)
             stage_9_llm_generation_ms = llm_result.get("generation_ms", 0.0)
             error_code = None
+        except (OpenRouterAccountQuotaExhaustedError, OpenRouterServiceError) as failover_err:
+            is_quota = isinstance(failover_err, OpenRouterAccountQuotaExhaustedError)
+            fail_reason = "quota_exhausted" if is_quota else "provider_outage"
+            notice_msg = (
+                "OpenRouter's daily free-model request limit has been reached. PropIntel AI is currently using its local Qwen model to generate responses."
+                if is_quota
+                else "OpenRouter service is temporarily unavailable. PropIntel AI is currently using its local Qwen model to generate responses."
+            )
+
+            if settings.OLLAMA_ENABLED and self.ollama_client:
+                logger.warning(
+                    f"RAG Provider Failover [{request_id}]: OpenRouter ({fail_reason}) -> Failing over to Ollama ({settings.OLLAMA_MODEL})"
+                )
+                try:
+                    ollama_res = await self.ollama_client.generate_completion(llm_messages, request_id=request_id)
+                    answer_text = ollama_res["content"].strip()
+                    model_used = f"ollama/{settings.OLLAMA_MODEL}"
+                    provider = "ollama"
+                    fallback_active = True
+                    fallback_reason = fail_reason
+                    fallback_notice = notice_msg
+                    stage_8_llm_dispatch_ms = ollama_res.get("dispatch_ms", 0.0)
+                    stage_9_llm_generation_ms = ollama_res.get("generation_ms", 0.0)
+                    error_code = None
+                except (OllamaUnavailableError, OllamaTimeoutError) as ollama_err:
+                    logger.error(
+                        f"RAG Dual Provider Failure [{request_id}]: OpenRouter failed ({fail_reason}) and Ollama failed ({ollama_err.message})"
+                    )
+                    total_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                    err_msg = (
+                        f"{failover_err.message} Additionally, local fallback to Qwen via Ollama failed: {ollama_err.message}"
+                        if is_quota
+                        else f"AI service is temporarily unavailable. Local fallback to Qwen via Ollama also failed: {ollama_err.message}"
+                    )
+                    return ChatResponse(
+                        answer=err_msg,
+                        citations=[],
+                        property_cards=[],
+                        confidence_score=0.0,
+                        grounded=False,
+                        data_mode=data_mode,
+                        provenance_warning=None,
+                        error_code="LLM_SERVICE_UNAVAILABLE",
+                        provider="openrouter",
+                        fallback_active=False,
+                        request_id=request_id,
+                        latency_ms=total_ms,
+                        stage_latencies={
+                            "1_request_received": True,
+                            "2_preprocessing_ms": stage_2_preprocessing_ms,
+                            "3_embedding_ms": stage_3_embedding_ms,
+                            "4_vector_search_ms": stage_4_vector_search_ms,
+                            "5_bm25_search_ms": stage_5_bm25_search_ms,
+                            "6_rrf_fusion_ms": stage_6_rrf_fusion_ms,
+                            "7_context_construction_ms": stage_7_context_construction_ms,
+                            "8_llm_dispatch_ms": 0.0,
+                            "9_llm_generation_ms": 0.0,
+                            "10_total_end_to_end_ms": total_ms,
+                        },
+                    )
+            else:
+                total_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                return ChatResponse(
+                    answer=failover_err.message,
+                    citations=[],
+                    property_cards=[],
+                    confidence_score=0.0,
+                    grounded=False,
+                    data_mode=data_mode,
+                    provenance_warning=None,
+                    error_code=getattr(failover_err, "error_code", "LLM_SERVICE_UNAVAILABLE"),
+                    retry_after=getattr(failover_err, "retry_after", None),
+                    provider="openrouter",
+                    fallback_active=False,
+                    request_id=request_id,
+                    latency_ms=total_ms,
+                    stage_latencies={
+                        "1_request_received": True,
+                        "2_preprocessing_ms": stage_2_preprocessing_ms,
+                        "3_embedding_ms": stage_3_embedding_ms,
+                        "4_vector_search_ms": stage_4_vector_search_ms,
+                        "5_bm25_search_ms": stage_5_bm25_search_ms,
+                        "6_rrf_fusion_ms": stage_6_rrf_fusion_ms,
+                        "7_context_construction_ms": stage_7_context_construction_ms,
+                        "8_llm_dispatch_ms": 0.0,
+                        "9_llm_generation_ms": 0.0,
+                        "10_total_end_to_end_ms": total_ms,
+                    },
+                )
         except LLMNotConfiguredException as e:
             logger.warning(f"RAG LLM Not Configured [{request_id}]: {e.message}")
             total_ms = round((time.perf_counter() - start_time) * 1000, 2)
@@ -266,6 +401,8 @@ class RAGOrchestrator:
                 data_mode=data_mode,
                 provenance_warning=None,
                 error_code="LLM_NOT_CONFIGURED",
+                provider="openrouter",
+                fallback_active=False,
                 request_id=request_id,
                 latency_ms=total_ms,
                 stage_latencies={
@@ -294,6 +431,8 @@ class RAGOrchestrator:
                 provenance_warning=None,
                 error_code="LLM_RATE_LIMITED",
                 retry_after=e.retry_after,
+                provider="openrouter",
+                fallback_active=False,
                 request_id=request_id,
                 latency_ms=total_ms,
                 stage_latencies={
@@ -321,6 +460,8 @@ class RAGOrchestrator:
                 data_mode=data_mode,
                 provenance_warning=None,
                 error_code=e.code,
+                provider="openrouter",
+                fallback_active=False,
                 request_id=request_id,
                 latency_ms=total_ms,
                 stage_latencies={
@@ -348,6 +489,8 @@ class RAGOrchestrator:
                 data_mode=data_mode,
                 provenance_warning=provenance_warning,
                 error_code="INTERNAL_ERROR",
+                provider="openrouter",
+                fallback_active=False,
                 request_id=request_id,
                 latency_ms=total_ms,
                 stage_latencies={
@@ -408,8 +551,7 @@ class RAGOrchestrator:
             f"LLMDispatch={stage_8_llm_dispatch_ms}ms, "
             f"LLMGeneration={stage_9_llm_generation_ms}ms, "
             f"Total={total_end_to_end_ms}ms | "
-            f"RetrievalTotal={total_retrieval_ms}ms, "
-            f"LLMTotal={round(stage_8_llm_dispatch_ms + stage_9_llm_generation_ms, 2)}ms"
+            f"Provider={provider}, Model={model_used}, Fallback={fallback_active}"
         )
 
         return ChatResponse(
@@ -425,6 +567,10 @@ class RAGOrchestrator:
             latency_ms=total_end_to_end_ms,
             stage_latencies=stage_latencies,
             model=model_used,
+            provider=provider,
+            fallback_active=fallback_active,
+            fallback_reason=fallback_reason,
+            fallback_notice=fallback_notice,
         )
 
     async def stream_answer_question(
@@ -453,9 +599,8 @@ class RAGOrchestrator:
 
         if is_conversational:
             total_ms = round((time.perf_counter() - start_time) * 1000, 2)
-            stage_2_preprocessing_ms = round((time.perf_counter() - t_pre_start) * 1000.0, 2)
             logger.info(
-                f"RAG Streaming Intent Fast-Path [{request_id}]: intent='{intent.value}' — skipping retrieval and LLM inference."
+                f"RAG Streaming Intent Fast-Path [{request_id}]: intent='{intent.value}' — streaming canned response directly."
             )
             yield {"event": "token", "data": {"token": canned_response}}
             yield {
@@ -467,6 +612,10 @@ class RAGOrchestrator:
                     "data_mode": "conversational",
                     "provenance_warning": None,
                     "model": None,
+                    "provider": "openrouter",
+                    "fallback_active": False,
+                    "fallback_reason": None,
+                    "fallback_notice": None,
                 },
             }
             yield {
@@ -478,12 +627,16 @@ class RAGOrchestrator:
                     "generation_ms": 0.0,
                     "total_tokens": len(canned_response.split()),
                     "model": None,
+                    "provider": "openrouter",
+                    "fallback_active": False,
+                    "fallback_reason": None,
+                    "fallback_notice": None,
                     "grounded": True,
                     "data_mode": "conversational",
                     "provenance_warning": None,
                     "stage_latencies": {
                         "1_request_received": True,
-                        "2_preprocessing_ms": stage_2_preprocessing_ms,
+                        "2_preprocessing_ms": round((time.perf_counter() - t_pre_start) * 1000.0, 2),
                         "3_embedding_ms": 0.0,
                         "4_vector_search_ms": 0.0,
                         "5_bm25_search_ms": 0.0,
@@ -567,6 +720,8 @@ class RAGOrchestrator:
                         "grounded": False,
                         "data_mode": "verified",
                         "provenance_warning": None,
+                        "provider": "openrouter",
+                        "fallback_active": False,
                     },
                 }
                 total_ms = round((time.perf_counter() - start_time) * 1000, 2)
@@ -578,7 +733,9 @@ class RAGOrchestrator:
                         "ttft_ms": total_ms,
                         "generation_ms": 0.0,
                         "total_tokens": 1,
-                        "model": self.llm_client.primary_model,
+                        "model": self.primary_model_name,
+                        "provider": "openrouter",
+                        "fallback_active": False,
                         "grounded": False,
                         "data_mode": "verified",
                         "provenance_warning": None,
@@ -611,6 +768,8 @@ class RAGOrchestrator:
                     "grounded": False,
                     "data_mode": data_mode,
                     "provenance_warning": provenance_warning,
+                    "provider": "openrouter",
+                    "fallback_active": False,
                 },
             }
             total_ms = round((time.perf_counter() - start_time) * 1000, 2)
@@ -622,7 +781,9 @@ class RAGOrchestrator:
                     "ttft_ms": total_ms,
                     "generation_ms": 0.0,
                     "total_tokens": 1,
-                    "model": self.llm_client.primary_model,
+                    "model": self.primary_model_name,
+                    "provider": "openrouter",
+                    "fallback_active": False,
                     "grounded": False,
                     "data_mode": data_mode,
                     "provenance_warning": provenance_warning,
@@ -651,6 +812,8 @@ class RAGOrchestrator:
                     "grounded": False,
                     "data_mode": data_mode,
                     "provenance_warning": provenance_warning,
+                    "provider": "openrouter",
+                    "fallback_active": False,
                 },
             }
             total_ms = round((time.perf_counter() - start_time) * 1000, 2)
@@ -662,7 +825,9 @@ class RAGOrchestrator:
                     "ttft_ms": total_ms,
                     "generation_ms": 0.0,
                     "total_tokens": 1,
-                    "model": self.llm_client.primary_model,
+                    "model": self.primary_model_name,
+                    "provider": "openrouter",
+                    "fallback_active": False,
                     "grounded": False,
                     "data_mode": data_mode,
                     "provenance_warning": provenance_warning,
@@ -694,7 +859,11 @@ class RAGOrchestrator:
         t_gen_start = time.perf_counter()
         first_token_time: Optional[float] = None
         accumulated_tokens: List[str] = []
-        model_used: str = self.llm_client.primary_model
+        model_used: str = self.primary_model_name
+        provider: str = "openrouter"
+        fallback_active: bool = False
+        fallback_reason: Optional[str] = None
+        fallback_notice: Optional[str] = None
 
         try:
             async for chunk in self.llm_client.stream_completion(llm_messages, request_id=request_id):
@@ -708,6 +877,109 @@ class RAGOrchestrator:
                 elif chunk.get("type") == "done":
                     if chunk.get("model"):
                         model_used = chunk["model"]
+        except (OpenRouterAccountQuotaExhaustedError, OpenRouterServiceError) as failover_err:
+            if accumulated_tokens:
+                # TOKENS ALREADY EMITTED! Strict rule: Never switch providers after tokens have been emitted.
+                logger.error(
+                    f"RAG Stream Error [{request_id}]: {failover_err.message} after {len(accumulated_tokens)} tokens delivered. Aborting stream without switching providers."
+                )
+                yield {
+                    "event": "error",
+                    "data": {
+                        "code": "LLM_SERVICE_UNAVAILABLE",
+                        "error_code": "LLM_SERVICE_UNAVAILABLE",
+                        "message": f"Stream interrupted: {failover_err.message}",
+                        "citations": [],
+                        "property_cards": [],
+                        "data_mode": data_mode,
+                        "provenance_warning": None,
+                        "provider": "openrouter",
+                        "fallback_active": False,
+                    },
+                }
+                return
+
+            is_quota = isinstance(failover_err, OpenRouterAccountQuotaExhaustedError)
+            fail_reason = "quota_exhausted" if is_quota else "provider_outage"
+            notice_msg = (
+                "OpenRouter's daily free-model request limit has been reached. PropIntel AI is currently using its local Qwen model to generate responses."
+                if is_quota
+                else "OpenRouter service is temporarily unavailable. PropIntel AI is currently using its local Qwen model to generate responses."
+            )
+
+            if settings.OLLAMA_ENABLED and self.ollama_client:
+                logger.warning(
+                    f"RAG Stream Failover [{request_id}]: OpenRouter ({fail_reason}) -> Failing over to Ollama ({settings.OLLAMA_MODEL})..."
+                )
+                yield {
+                    "event": "status",
+                    "data": {
+                        "stage": "generating",
+                        "message": (
+                            "OpenRouter daily quota reached. Routing to local Qwen 2.5 model..."
+                            if is_quota
+                            else "OpenRouter unavailable. Routing to local Qwen 2.5 model..."
+                        ),
+                    },
+                }
+                provider = "ollama"
+                model_used = f"ollama/{settings.OLLAMA_MODEL}"
+                fallback_active = True
+                fallback_reason = fail_reason
+                fallback_notice = notice_msg
+
+                try:
+                    async for chunk in self.ollama_client.stream_completion(llm_messages, request_id=request_id):
+                        if chunk.get("type") == "token":
+                            token = chunk.get("token", "")
+                            if token:
+                                if first_token_time is None:
+                                    first_token_time = time.perf_counter()
+                                accumulated_tokens.append(token)
+                                yield {"event": "token", "data": {"token": token}}
+                        elif chunk.get("type") == "done":
+                            pass
+                except (OllamaUnavailableError, OllamaTimeoutError) as ollama_err:
+                    logger.error(
+                        f"RAG Dual Provider Stream Failure [{request_id}]: OpenRouter failed ({fail_reason}) and Ollama failed ({ollama_err.message})"
+                    )
+                    err_msg = (
+                        f"{failover_err.message} Additionally, local fallback to Qwen via Ollama failed: {ollama_err.message}"
+                        if is_quota
+                        else f"AI service is temporarily unavailable. Local fallback to Qwen via Ollama also failed: {ollama_err.message}"
+                    )
+                    yield {
+                        "event": "error",
+                        "data": {
+                            "code": "LLM_SERVICE_UNAVAILABLE",
+                            "error_code": "LLM_SERVICE_UNAVAILABLE",
+                            "message": err_msg,
+                            "citations": [],
+                            "property_cards": [],
+                            "data_mode": data_mode,
+                            "provenance_warning": None,
+                            "provider": "openrouter",
+                            "fallback_active": False,
+                        },
+                    }
+                    return
+            else:
+                yield {
+                    "event": "error",
+                    "data": {
+                        "code": getattr(failover_err, "error_code", "LLM_SERVICE_UNAVAILABLE"),
+                        "error_code": getattr(failover_err, "error_code", "LLM_SERVICE_UNAVAILABLE"),
+                        "message": failover_err.message,
+                        "retry_after": getattr(failover_err, "retry_after", None),
+                        "citations": [],
+                        "property_cards": [],
+                        "data_mode": data_mode,
+                        "provenance_warning": None,
+                        "provider": "openrouter",
+                        "fallback_active": False,
+                    },
+                }
+                return
         except LLMNotConfiguredException as e:
             logger.warning(f"RAG Streaming LLM Not Configured [{request_id}]: {e.message}")
             yield {
@@ -723,6 +995,8 @@ class RAGOrchestrator:
                     "property_cards": [],
                     "data_mode": data_mode,
                     "provenance_warning": None,
+                    "provider": "openrouter",
+                    "fallback_active": False,
                 },
             }
             return
@@ -741,6 +1015,8 @@ class RAGOrchestrator:
                     "property_cards": [],
                     "data_mode": data_mode,
                     "provenance_warning": None,
+                    "provider": "openrouter",
+                    "fallback_active": False,
                 },
             }
             return
@@ -757,6 +1033,8 @@ class RAGOrchestrator:
                     "property_cards": [],
                     "data_mode": data_mode,
                     "provenance_warning": None,
+                    "provider": "openrouter",
+                    "fallback_active": False,
                 },
             }
             return
@@ -772,6 +1050,8 @@ class RAGOrchestrator:
                     "property_cards": [],
                     "data_mode": data_mode,
                     "provenance_warning": None,
+                    "provider": "openrouter",
+                    "fallback_active": False,
                 },
             }
             return
@@ -813,6 +1093,10 @@ class RAGOrchestrator:
                 "data_mode": data_mode,
                 "provenance_warning": provenance_warning,
                 "model": model_used,
+                "provider": provider,
+                "fallback_active": fallback_active,
+                "fallback_reason": fallback_reason,
+                "fallback_notice": fallback_notice,
             },
         }
 
@@ -840,6 +1124,10 @@ class RAGOrchestrator:
                 "generation_ms": generation_ms,
                 "total_tokens": len(accumulated_tokens),
                 "model": model_used,
+                "provider": provider,
+                "fallback_active": fallback_active,
+                "fallback_reason": fallback_reason,
+                "fallback_notice": fallback_notice,
                 "grounded": is_num_valid,
                 "data_mode": data_mode,
                 "provenance_warning": provenance_warning,

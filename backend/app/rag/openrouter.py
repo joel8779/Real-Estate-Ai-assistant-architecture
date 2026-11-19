@@ -1,12 +1,14 @@
-"""OpenRouter Chat Completions Client.
+"""OpenRouter Chat Completions Client (Primary Provider).
 
 Provides an asynchronous, resilient client for OpenRouter's OpenAI-compatible API
-with automatic model fallbacks, bounded retries on transient errors (429/5xx),
-and strict credential protection.
+locked strictly to NVIDIA Nemotron 3 Ultra (nvidia/nemotron-3-ultra-550b-a55b:free).
+Implements bounded retries on transient errors (502/503/504, connection timeouts)
+and strict account-level quota exhaustion detection.
 """
 
 import asyncio
 import json
+import os
 import time
 from typing import Any, AsyncGenerator, Dict, List, Optional
 import httpx
@@ -67,7 +69,7 @@ def is_account_level_quota_exhausted(err_text: str) -> bool:
     """Detect if HTTP 429 represents an account-wide daily limit (e.g. 50 req/day).
 
     OpenRouter free models share an account-wide daily limit. When this is hit,
-    trying another free fallback model will also fail, so fallback must NOT be attempted.
+    trying another free model will also fail, so secondary fallback must be invoked.
     """
     if not err_text:
         return False
@@ -87,7 +89,7 @@ def is_account_level_quota_exhausted(err_text: str) -> bool:
 
 
 class OpenRouterRateLimitError(KnowledgeBaseException):
-    """Raised when rate limits are exceeded across attempts."""
+    """Raised when model-specific rate limits are exceeded across attempts."""
 
     def __init__(
         self,
@@ -104,8 +106,20 @@ class OpenRouterRateLimitError(KnowledgeBaseException):
         self.retry_after = retry_after
 
 
+class OpenRouterAccountQuotaExhaustedError(OpenRouterRateLimitError):
+    """Raised when OpenRouter account-wide free-model daily quota is exhausted."""
+
+    def __init__(
+        self,
+        message: str = "OpenRouter free daily request limit reached for this account. Please try again tomorrow or upgrade your OpenRouter account.",
+        retry_after: Optional[int] = None,
+    ):
+        super().__init__(message=message, retry_after=retry_after)
+        self.error_code = "ACCOUNT_DAILY_QUOTA_EXHAUSTED"
+
+
 class OpenRouterServiceError(KnowledgeBaseException):
-    """Raised when OpenRouter service is unavailable."""
+    """Raised when OpenRouter service is unavailable or encounters upstream failure."""
 
     def __init__(self, message: str = "The AI service is temporarily unavailable. Please try again later."):
         super().__init__(message=message, code="LLM_SERVICE_UNAVAILABLE", status_code=503)
@@ -113,7 +127,7 @@ class OpenRouterServiceError(KnowledgeBaseException):
 
 
 class OpenRouterClient:
-    """Asynchronous OpenRouter LLM client with connection pooling, model failover and retries."""
+    """Asynchronous OpenRouter LLM client locked strictly to NVIDIA Nemotron 3 Ultra."""
 
     _shared_client: Optional[httpx.AsyncClient] = None
     _client_lock: Optional[asyncio.Lock] = None
@@ -123,8 +137,6 @@ class OpenRouterClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         primary_model: Optional[str] = None,
-        allow_fallback: Optional[bool] = None,
-        fallback_models: Optional[List[str]] = None,
         timeout_seconds: Optional[float] = None,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
@@ -133,12 +145,6 @@ class OpenRouterClient:
         self.api_key = api_key if api_key is not None else settings.OPENROUTER_API_KEY
         self.base_url = (base_url or settings.OPENROUTER_BASE_URL).rstrip("/")
         self.primary_model = primary_model or settings.OPENROUTER_MODEL
-        self.allow_fallback = (
-            allow_fallback if allow_fallback is not None else settings.OPENROUTER_ALLOW_FALLBACK
-        )
-        self.fallback_models = (
-            fallback_models if fallback_models is not None else settings.OPENROUTER_FALLBACK_MODELS
-        )
         self.timeout_seconds = timeout_seconds or settings.LLM_TIMEOUT_SECONDS
         self.temperature = temperature if temperature is not None else settings.LLM_TEMPERATURE
         self.max_tokens = max_tokens or settings.LLM_MAX_TOKENS
@@ -193,7 +199,7 @@ class OpenRouterClient:
         max_tokens: Optional[int] = None,
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Send chat completion request to OpenRouter with automatic fallback chain and timing metrics.
+        """Send chat completion request to OpenRouter (Nemotron 3 Ultra).
 
         Args:
             messages: List of message dictionaries with 'role' and 'content'.
@@ -206,12 +212,12 @@ class OpenRouterClient:
 
         Raises:
             LLMNotConfiguredException: If API key is missing.
-            OpenRouterAuthError: On 401 response.
-            OpenRouterQuotaError: On 402 response.
-            OpenRouterServiceError: If all candidate models fail.
+            OpenRouterAuthError: On 401 response (permanent).
+            OpenRouterQuotaError: On 402 response (permanent).
+            OpenRouterAccountQuotaExhaustedError: On account daily quota 429.
+            OpenRouterRateLimitError: On model 429 after retry.
+            OpenRouterServiceError: On 502/503/504 or network timeout after retry.
         """
-        import time
-
         req_id = request_id or "req_direct"
         t_route_start = time.perf_counter()
 
@@ -220,7 +226,6 @@ class OpenRouterClient:
 
         t_dispatch_start = time.perf_counter()
 
-        import os
         if os.environ.get("STREAM_TEST_MODE") == "true":
             return {
                 "content": (
@@ -233,221 +238,118 @@ class OpenRouterClient:
                 "generation_ms": 720.0,
             }
 
-        # Build candidate models list: primary, and fallbacks only if allow_fallback is enabled (Priority 1, 2, 3)
-        candidate_models = [self.primary_model]
-        if self.allow_fallback:
-            for m in self.fallback_models:
-                if m and m not in candidate_models:
-                    candidate_models.append(m)
-                if len(candidate_models) >= 3:
-                    break
-        else:
-            logger.debug(
-                f"Model locked to '{self.primary_model}'. Automatic fallback is disabled by default."
-            )
-
         headers = self._get_headers()
         temp = temperature if temperature is not None else self.temperature
         max_t = max_tokens or self.max_tokens
-
-        last_error_msg = ""
         client = await self.get_shared_client(self.timeout_seconds)
-
         dispatch_ms = round((time.perf_counter() - t_dispatch_start) * 1000, 2)
 
-        for model_idx, model in enumerate(candidate_models):
-            priority_label = (
-                "Priority 1 (Primary)" if model_idx == 0
-                else f"Priority {model_idx + 1} (Fallback {model_idx})"
-            )
-            logger.info(f"OpenRouter Attempting [{req_id}]: model='{model}', priority='{priority_label}'...")
+        model = self.primary_model
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temp,
+            "max_tokens": max_t,
+        }
 
-            # Allow up to 2 attempts per model for transient errors
-            for attempt in range(1, 3):
-                payload = {
-                    "model": model,
-                    "messages": messages,
-                    "temperature": temp,
-                    "max_tokens": max_t,
-                }
+        logger.info(f"OpenRouter Primary Dispatch [{req_id}]: model='{model}'...")
 
-                try:
-                    t_gen_start = time.perf_counter()
-                    resp = await client.post(
-                        f"{self.base_url}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                    )
-                    gen_ms = round((time.perf_counter() - t_gen_start) * 1000, 2)
-                    total_routing_ms = round((time.perf_counter() - t_route_start) * 1000, 2)
+        # Up to 2 attempts for transient errors (502/503/504, connection timeouts)
+        for attempt in range(1, 3):
+            try:
+                t_gen_start = time.perf_counter()
+                resp = await client.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                )
+                gen_ms = round((time.perf_counter() - t_gen_start) * 1000, 2)
+                total_routing_ms = round((time.perf_counter() - t_route_start) * 1000, 2)
 
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        choices = data.get("choices", [])
-                        if not choices:
-                            raise ValueError("Empty choices list in OpenRouter response.")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    choices = data.get("choices", [])
+                    if not choices:
+                        raise ValueError("Empty choices list in OpenRouter response.")
 
-                        message_obj = choices[0].get("message", {})
-                        content = message_obj.get("content", "")
-                        usage = data.get("usage", {})
+                    message_obj = choices[0].get("message", {})
+                    content = message_obj.get("content", "")
+                    usage = data.get("usage", {})
 
-                        logger.info(
-                            f"OpenRouter Model Routing [{req_id}]: "
-                            f"model='{model}', "
-                            f"attempt_priority='{priority_label}', "
-                            f"http_status=200, "
-                            f"failure_classification='NONE (SUCCESS)', "
-                            f"fallback_triggered={model_idx > 0}, "
-                            f"final_model='{model}', "
-                            f"total_routing_duration_ms={total_routing_ms}"
-                        )
-                        return {
-                            "content": content,
-                            "model": model,
-                            "usage": usage,
-                            "dispatch_ms": dispatch_ms,
-                            "generation_ms": gen_ms,
-                        }
-
-                    # Specific error status handling
-                    if resp.status_code == 400:
-                        logger.error(
-                            f"OpenRouter Model Routing [{req_id}]: "
-                            f"model='{model}', "
-                            f"attempt_priority='{priority_label}', "
-                            f"http_status=400, "
-                            f"failure_classification='INVALID_REQUEST_400', "
-                            f"fallback_triggered=False, "
-                            f"final_model=None, "
-                            f"total_routing_duration_ms={total_routing_ms}"
-                        )
-                        raise KnowledgeBaseException(
-                            message=f"Invalid request to AI model: {resp.text[:150]}",
-                            code="LLM_INVALID_REQUEST",
-                            status_code=400,
-                        )
-
-                    if resp.status_code == 401:
-                        logger.error(
-                            f"OpenRouter Model Routing [{req_id}]: "
-                            f"model='{model}', "
-                            f"attempt_priority='{priority_label}', "
-                            f"http_status=401, "
-                            f"failure_classification='AUTH_ERROR_401', "
-                            f"fallback_triggered=False, "
-                            f"final_model=None, "
-                            f"total_routing_duration_ms={total_routing_ms}"
-                        )
-                        raise OpenRouterAuthError()
-
-                    if resp.status_code == 402:
-                        logger.error(
-                            f"OpenRouter Model Routing [{req_id}]: "
-                            f"model='{model}', "
-                            f"attempt_priority='{priority_label}', "
-                            f"http_status=402, "
-                            f"failure_classification='QUOTA_EXCEEDED_402', "
-                            f"fallback_triggered=False, "
-                            f"final_model=None, "
-                            f"total_routing_duration_ms={total_routing_ms}"
-                        )
-                        raise OpenRouterQuotaError()
-
-                    if resp.status_code == 429:
-                        retry_after = parse_retry_after(getattr(resp, "headers", None))
-                        err_text = resp.text
-                        if is_account_level_quota_exhausted(err_text):
-                            logger.warning(
-                                f"OpenRouter Model Routing [{req_id}]: "
-                                f"model='{model}', "
-                                f"attempt_priority='{priority_label}', "
-                                f"http_status=429, "
-                                f"failure_classification='ACCOUNT_DAILY_QUOTA_EXHAUSTED', "
-                                f"fallback_triggered=False, "
-                                f"final_model=None, "
-                                f"total_routing_duration_ms={total_routing_ms}"
-                            )
-                            raise OpenRouterRateLimitError(
-                                message="OpenRouter free daily request limit reached for this account. Please try again tomorrow or upgrade your OpenRouter account.",
-                                retry_after=retry_after,
-                            )
-
-                        fallback_triggered = bool(self.allow_fallback and model != candidate_models[-1])
-                        logger.warning(
-                            f"OpenRouter Model Routing [{req_id}]: "
-                            f"model='{model}', "
-                            f"attempt_priority='{priority_label}', "
-                            f"http_status=429, "
-                            f"failure_classification='MODEL_RATE_LIMITED_429', "
-                            f"fallback_triggered={fallback_triggered}, "
-                            f"final_model=None, "
-                            f"total_routing_duration_ms={total_routing_ms}"
-                        )
-                        if self.allow_fallback:
-                            if attempt < 2:
-                                await asyncio.sleep(1.0 * attempt)
-                                continue
-                            if model != candidate_models[-1]:
-                                last_error_msg = f"Rate limited on model '{model}'"
-                                break
-                        raise OpenRouterRateLimitError(retry_after=retry_after)
-
-                    if resp.status_code in (500, 502, 503, 504, 404):
-                        fail_class = "MODEL_NOT_FOUND_404" if resp.status_code == 404 else f"UPSTREAM_{resp.status_code}"
-                        fallback_triggered = bool(self.allow_fallback and model != candidate_models[-1])
-                        logger.warning(
-                            f"OpenRouter Model Routing [{req_id}]: "
-                            f"model='{model}', "
-                            f"attempt_priority='{priority_label}', "
-                            f"http_status={resp.status_code}, "
-                            f"failure_classification='{fail_class}', "
-                            f"fallback_triggered={fallback_triggered}, "
-                            f"final_model=None, "
-                            f"total_routing_duration_ms={total_routing_ms}"
-                        )
-                        if attempt < 2:
-                            await asyncio.sleep(1.0 * attempt)
-                            continue
-                        if self.allow_fallback and model != candidate_models[-1]:
-                            last_error_msg = f"HTTP {resp.status_code} on {model}"
-                            break
-                        last_error_msg = f"HTTP {resp.status_code} on {model}"
-                        break  # Try next model
-
-                    # Other unexpected status codes
-                    last_error_msg = f"HTTP {resp.status_code}: {resp.text[:150]}"
-                    logger.warning(f"Unexpected status code for '{model}': {last_error_msg}")
-                    break
-
-                except (OpenRouterAuthError, OpenRouterQuotaError, OpenRouterRateLimitError, KnowledgeBaseException):
-                    raise
-                except (httpx.TimeoutException, httpx.NetworkError) as net_err:
-                    total_routing_ms = round((time.perf_counter() - t_route_start) * 1000, 2)
-                    fallback_triggered = bool(self.allow_fallback and model != candidate_models[-1])
-                    logger.warning(
+                    logger.info(
                         f"OpenRouter Model Routing [{req_id}]: "
                         f"model='{model}', "
-                        f"attempt_priority='{priority_label}', "
-                        f"http_status=0, "
-                        f"failure_classification='NETWORK_OR_TIMEOUT_ERROR', "
-                        f"fallback_triggered={fallback_triggered}, "
-                        f"final_model=None, "
-                        f"total_routing_duration_ms={total_routing_ms}"
+                        f"http_status=200, "
+                        f"duration_ms={total_routing_ms}"
                     )
+                    return {
+                        "content": content,
+                        "model": model,
+                        "usage": usage,
+                        "dispatch_ms": dispatch_ms,
+                        "generation_ms": gen_ms,
+                    }
+
+                # Permanent client / auth errors: never retry, never failover
+                if resp.status_code == 400:
+                    raise KnowledgeBaseException(
+                        message=f"Invalid request to AI model: {resp.text[:150]}",
+                        code="LLM_INVALID_REQUEST",
+                        status_code=400,
+                    )
+
+                if resp.status_code == 401:
+                    raise OpenRouterAuthError()
+
+                if resp.status_code == 402:
+                    raise OpenRouterQuotaError()
+
+                # Rate limits (429)
+                if resp.status_code == 429:
+                    retry_after = parse_retry_after(getattr(resp, "headers", None))
+                    err_text = resp.text
+                    if is_account_level_quota_exhausted(err_text):
+                        logger.warning(
+                            f"OpenRouter Account Daily Quota Exhausted [{req_id}]: {err_text[:120]}"
+                        )
+                        raise OpenRouterAccountQuotaExhaustedError(retry_after=retry_after)
+
+                    # Model-specific transient rate limit: retry once with backoff
                     if attempt < 2:
+                        logger.warning(f"OpenRouter 429 model rate limit [{req_id}], retrying once...")
                         await asyncio.sleep(1.0)
                         continue
-                    if self.allow_fallback and model != candidate_models[-1]:
-                        last_error_msg = f"Network timeout on {model}: {str(net_err)}"
-                        break
-                    last_error_msg = f"Network timeout on {model}: {str(net_err)}"
-                    break
+                    raise OpenRouterRateLimitError(retry_after=retry_after)
 
-        # If we exited the loop without returning, all candidate models failed
-        logger.error(f"All candidate OpenRouter models failed. Last error: {last_error_msg}")
-        raise OpenRouterServiceError(
-            f"All configured models failed to respond. Last error: {last_error_msg}"
-        )
+                # Upstream outage (500, 502, 503, 504)
+                if resp.status_code in (500, 502, 503, 504):
+                    if attempt < 2:
+                        logger.warning(f"OpenRouter HTTP {resp.status_code} [{req_id}], retrying once...")
+                        await asyncio.sleep(1.0)
+                        continue
+                    raise OpenRouterServiceError(
+                        f"OpenRouter upstream service error (HTTP {resp.status_code}): {resp.text[:120]}"
+                    )
+
+                raise OpenRouterServiceError(f"HTTP {resp.status_code}: {resp.text[:120]}")
+
+            except (
+                OpenRouterAuthError,
+                OpenRouterQuotaError,
+                OpenRouterAccountQuotaExhaustedError,
+                OpenRouterRateLimitError,
+                OpenRouterServiceError,
+                KnowledgeBaseException,
+            ):
+                raise
+            except (httpx.TimeoutException, httpx.NetworkError) as net_err:
+                if attempt < 2:
+                    logger.warning(f"OpenRouter network/timeout error [{req_id}], retrying once: {net_err}")
+                    await asyncio.sleep(1.0)
+                    continue
+                raise OpenRouterServiceError(f"OpenRouter network timeout / connection error: {str(net_err)}")
+
+        raise OpenRouterServiceError("OpenRouter failed to respond after retries.")
 
     async def stream_completion(
         self,
@@ -466,10 +368,11 @@ class OpenRouterClient:
 
         Raises:
             LLMNotConfiguredException: If API key is missing.
-            OpenRouterAuthError: On 401 response.
-            OpenRouterQuotaError: On 402 response.
-            OpenRouterRateLimitError: On 429 response.
-            OpenRouterServiceError: If stream fails or model returns 5xx/network error.
+            OpenRouterAuthError: On 401 response (permanent).
+            OpenRouterQuotaError: On 402 response (permanent).
+            OpenRouterAccountQuotaExhaustedError: On account quota exhaustion before stream starts.
+            OpenRouterRateLimitError: On model 429 before stream starts.
+            OpenRouterServiceError: On 502/503/504, network timeout, or if stream drops mid-stream.
         """
         req_id = request_id or "req_direct"
         t_route_start = time.perf_counter()
@@ -477,7 +380,6 @@ class OpenRouterClient:
         if not self.is_configured():
             raise LLMNotConfiguredException()
 
-        import os
         if os.environ.get("STREAM_TEST_MODE") == "true":
             logger.info("STREAM_TEST_MODE active: Emitting calibrated token stream for verification.")
             test_tokens = [
@@ -491,246 +393,136 @@ class OpenRouterClient:
             yield {"type": "done", "model": self.primary_model}
             return
 
-        # Build candidate models list: primary, and fallbacks only if allow_fallback is enabled (Priority 1, 2, 3)
-        candidate_models = [self.primary_model]
-        if self.allow_fallback:
-            for m in self.fallback_models:
-                if m and m not in candidate_models:
-                    candidate_models.append(m)
-                if len(candidate_models) >= 3:
-                    break
-        else:
-            logger.debug(
-                f"Model locked to '{self.primary_model}'. Automatic fallback is disabled by default."
-            )
-
         headers = self._get_headers()
         temp = temperature if temperature is not None else self.temperature
         max_t = max_tokens or self.max_tokens
-
         client = await self.get_shared_client(self.timeout_seconds)
-        last_error_msg = ""
 
-        for model_idx, model in enumerate(candidate_models):
-            priority_label = (
-                "Priority 1 (Primary)" if model_idx == 0
-                else f"Priority {model_idx + 1} (Fallback {model_idx})"
-            )
-            logger.info(f"OpenRouter Stream Attempting [{req_id}]: model='{model}', priority='{priority_label}'...")
+        model = self.primary_model
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temp,
+            "max_tokens": max_t,
+            "stream": True,
+        }
 
-            for attempt in range(1, 3):
-                payload = {
-                    "model": model,
-                    "messages": messages,
-                    "temperature": temp,
-                    "max_tokens": max_t,
-                    "stream": True,
-                }
+        logger.info(f"OpenRouter Primary Stream Dispatch [{req_id}]: model='{model}'...")
 
-                stream_started = False
-                tokens_emitted = 0
-                try:
-                    async with client.stream(
-                        "POST",
-                        f"{self.base_url}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                    ) as resp:
-                        total_routing_ms = round((time.perf_counter() - t_route_start) * 1000, 2)
-                        if resp.status_code == 200:
-                            logger.info(
-                                f"OpenRouter Model Routing [{req_id}]: "
-                                f"model='{model}', "
-                                f"attempt_priority='{priority_label}', "
-                                f"http_status=200, "
-                                f"failure_classification='NONE (SUCCESS)', "
-                                f"fallback_triggered={model_idx > 0}, "
-                                f"final_model='{model}', "
-                                f"total_routing_duration_ms={total_routing_ms}"
-                            )
-                            async for line in resp.aiter_lines():
-                                line = line.strip()
-                                if not line:
-                                    continue
-                                if line.startswith("data:"):
-                                    data_str = line[5:].strip()
-                                    if data_str == "[DONE]":
-                                        yield {"type": "done", "model": model}
-                                        return
-                                    try:
-                                        chunk = json.loads(data_str)
-                                    except json.JSONDecodeError:
-                                        continue
-
-                                    if "error" in chunk:
-                                        err_obj = chunk.get("error", {})
-                                        err_msg = err_obj.get("message", "Stream chunk error")
-                                        if stream_started:
-                                            logger.error(f"Error received mid-stream on model '{model}': {err_msg}")
-                                            raise OpenRouterServiceError(f"Stream interrupted: {err_msg}")
-                                        else:
-                                            if is_account_level_quota_exhausted(err_msg):
-                                                raise OpenRouterRateLimitError(message=err_msg)
-                                            if self.allow_fallback and model != candidate_models[-1]:
-                                                last_error_msg = f"Stream error on {model}: {err_msg}"
-                                                break
-                                            raise OpenRouterServiceError(f"OpenRouter stream error: {err_msg}")
-
-                                    choices = chunk.get("choices", [])
-                                    if choices:
-                                        delta = choices[0].get("delta", {})
-                                        content = delta.get("content")
-                                        if content:
-                                            stream_started = True
-                                            tokens_emitted += 1
-                                            yield {"type": "token", "token": content}
-
-                                    usage = chunk.get("usage")
-                                    if usage:
-                                        yield {"type": "usage", "usage": usage}
-
-                            yield {"type": "done", "model": model}
-                            return
-
-                        # Non-200 responses before stream started
-                        error_bytes = await resp.aread()
-                        err_text = error_bytes.decode("utf-8", errors="ignore")
-
-                        if resp.status_code == 400:
-                            logger.error(
-                                f"OpenRouter Model Routing [{req_id}]: "
-                                f"model='{model}', "
-                                f"attempt_priority='{priority_label}', "
-                                f"http_status=400, "
-                                f"failure_classification='INVALID_REQUEST_400', "
-                                f"fallback_triggered=False, "
-                                f"final_model=None, "
-                                f"total_routing_duration_ms={total_routing_ms}"
-                            )
-                            raise KnowledgeBaseException(
-                                message=f"Invalid request to AI model: {err_text[:150]}",
-                                code="LLM_INVALID_REQUEST",
-                                status_code=400,
-                            )
-
-                        if resp.status_code == 401:
-                            logger.error(
-                                f"OpenRouter Model Routing [{req_id}]: "
-                                f"model='{model}', "
-                                f"attempt_priority='{priority_label}', "
-                                f"http_status=401, "
-                                f"failure_classification='AUTH_ERROR_401', "
-                                f"fallback_triggered=False, "
-                                f"final_model=None, "
-                                f"total_routing_duration_ms={total_routing_ms}"
-                            )
-                            raise OpenRouterAuthError()
-
-                        if resp.status_code == 402:
-                            logger.error(
-                                f"OpenRouter Model Routing [{req_id}]: "
-                                f"model='{model}', "
-                                f"attempt_priority='{priority_label}', "
-                                f"http_status=402, "
-                                f"failure_classification='QUOTA_EXCEEDED_402', "
-                                f"fallback_triggered=False, "
-                                f"final_model=None, "
-                                f"total_routing_duration_ms={total_routing_ms}"
-                            )
-                            raise OpenRouterQuotaError()
-
-                        if resp.status_code == 429:
-                            retry_after = parse_retry_after(getattr(resp, "headers", None))
-                            if is_account_level_quota_exhausted(err_text):
-                                logger.warning(
-                                    f"OpenRouter Model Routing [{req_id}]: "
-                                    f"model='{model}', "
-                                    f"attempt_priority='{priority_label}', "
-                                    f"http_status=429, "
-                                    f"failure_classification='ACCOUNT_DAILY_QUOTA_EXHAUSTED', "
-                                    f"fallback_triggered=False, "
-                                    f"final_model=None, "
-                                    f"total_routing_duration_ms={total_routing_ms}"
-                                )
-                                raise OpenRouterRateLimitError(
-                                    message="OpenRouter free daily request limit reached for this account. Please try again tomorrow or upgrade your OpenRouter account.",
-                                    retry_after=retry_after,
-                                )
-
-                            fallback_triggered = bool(self.allow_fallback and model != candidate_models[-1])
-                            logger.warning(
-                                f"OpenRouter Model Routing [{req_id}]: "
-                                f"model='{model}', "
-                                f"attempt_priority='{priority_label}', "
-                                f"http_status=429, "
-                                f"failure_classification='MODEL_RATE_LIMITED_429', "
-                                f"fallback_triggered={fallback_triggered}, "
-                                f"final_model=None, "
-                                f"total_routing_duration_ms={total_routing_ms}"
-                            )
-                            if self.allow_fallback:
-                                if attempt < 2:
-                                    await asyncio.sleep(1.0 * attempt)
-                                    continue
-                                if model != candidate_models[-1]:
-                                    last_error_msg = f"Rate limited on model '{model}'"
-                                    break
-                            raise OpenRouterRateLimitError(retry_after=retry_after)
-
-                        if resp.status_code in (500, 502, 503, 504, 404):
-                            fail_class = "MODEL_NOT_FOUND_404" if resp.status_code == 404 else f"UPSTREAM_{resp.status_code}"
-                            fallback_triggered = bool(self.allow_fallback and model != candidate_models[-1])
-                            logger.warning(
-                                f"OpenRouter Model Routing [{req_id}]: "
-                                f"model='{model}', "
-                                f"attempt_priority='{priority_label}', "
-                                f"http_status={resp.status_code}, "
-                                f"failure_classification='{fail_class}', "
-                                f"fallback_triggered={fallback_triggered}, "
-                                f"final_model=None, "
-                                f"total_routing_duration_ms={total_routing_ms}"
-                            )
-                            if attempt < 2:
-                                await asyncio.sleep(1.0 * attempt)
-                                continue
-                            if self.allow_fallback and model != candidate_models[-1]:
-                                last_error_msg = f"HTTP {resp.status_code} on {model}: {err_text[:150]}"
-                                break
-                            last_error_msg = f"HTTP {resp.status_code} on {model}: {err_text[:150]}"
-                            break
-
-                        last_error_msg = f"HTTP {resp.status_code}: {err_text[:150]}"
-                        break
-
-                except (OpenRouterAuthError, OpenRouterQuotaError, OpenRouterRateLimitError, KnowledgeBaseException):
-                    raise
-                except (httpx.TimeoutException, httpx.NetworkError) as net_err:
-                    if stream_started:
-                        # Tokens were already emitted! Strictly DO NOT fallback or concatenate another model!
-                        logger.error(f"Network error mid-stream for model '{model}' after {tokens_emitted} tokens: {net_err}")
-                        raise OpenRouterServiceError(f"Stream interrupted by network error: {net_err}")
-
+        # Up to 2 attempts before stream starts
+        for attempt in range(1, 3):
+            stream_started = False
+            tokens_emitted = 0
+            try:
+                async with client.stream(
+                    "POST",
+                    f"{self.base_url}/chat/completions",
+                    headers=headers,
+                    json=payload,
+                ) as resp:
                     total_routing_ms = round((time.perf_counter() - t_route_start) * 1000, 2)
-                    fallback_triggered = bool(self.allow_fallback and model != candidate_models[-1])
-                    logger.warning(
-                        f"OpenRouter Model Routing [{req_id}]: "
-                        f"model='{model}', "
-                        f"attempt_priority='{priority_label}', "
-                        f"http_status=0, "
-                        f"failure_classification='NETWORK_OR_TIMEOUT_ERROR', "
-                        f"fallback_triggered={fallback_triggered}, "
-                        f"final_model=None, "
-                        f"total_routing_duration_ms={total_routing_ms}"
-                    )
-                    if attempt < 2:
-                        await asyncio.sleep(1.0)
-                        continue
-                    if self.allow_fallback and model != candidate_models[-1]:
-                        last_error_msg = f"Network timeout on {model}: {str(net_err)}"
-                        break
-                    last_error_msg = f"Network timeout on {model}: {str(net_err)}"
-                    break
+                    if resp.status_code == 200:
+                        async for line in resp.aiter_lines():
+                            line = line.strip()
+                            if not line:
+                                continue
+                            if line.startswith("data:"):
+                                data_str = line[5:].strip()
+                                if data_str == "[DONE]":
+                                    yield {"type": "done", "model": model}
+                                    return
+                                try:
+                                    chunk = json.loads(data_str)
+                                except json.JSONDecodeError:
+                                    continue
 
-        raise OpenRouterServiceError(
-            f"All configured models failed to start streaming. Last error: {last_error_msg}"
-        )
+                                if "error" in chunk:
+                                    err_obj = chunk.get("error", {})
+                                    err_msg = err_obj.get("message", "Stream chunk error")
+                                    if stream_started:
+                                        # NEVER switch providers mid-stream once tokens have been delivered!
+                                        logger.error(f"Error received mid-stream on model '{model}': {err_msg}")
+                                        raise OpenRouterServiceError(f"Stream interrupted: {err_msg}")
+                                    if is_account_level_quota_exhausted(err_msg):
+                                        raise OpenRouterAccountQuotaExhaustedError(message=err_msg)
+                                    raise OpenRouterServiceError(f"OpenRouter stream error: {err_msg}")
+
+                                choices = chunk.get("choices", [])
+                                if choices:
+                                    delta = choices[0].get("delta", {})
+                                    content = delta.get("content")
+                                    if content:
+                                        stream_started = True
+                                        tokens_emitted += 1
+                                        yield {"type": "token", "token": content}
+
+                                usage = chunk.get("usage")
+                                if usage:
+                                    yield {"type": "usage", "usage": usage}
+
+                        yield {"type": "done", "model": model}
+                        return
+
+                    # Error before stream started
+                    error_bytes = await resp.aread()
+                    err_text = error_bytes.decode("utf-8", errors="ignore")
+
+                    if resp.status_code == 400:
+                        raise KnowledgeBaseException(
+                            message=f"Invalid request to AI model: {err_text[:150]}",
+                            code="LLM_INVALID_REQUEST",
+                            status_code=400,
+                        )
+
+                    if resp.status_code == 401:
+                        raise OpenRouterAuthError()
+
+                    if resp.status_code == 402:
+                        raise OpenRouterQuotaError()
+
+                    if resp.status_code == 429:
+                        retry_after = parse_retry_after(getattr(resp, "headers", None))
+                        if is_account_level_quota_exhausted(err_text):
+                            logger.warning(
+                                f"OpenRouter Stream Account Quota Exhausted [{req_id}]: {err_text[:120]}"
+                            )
+                            raise OpenRouterAccountQuotaExhaustedError(retry_after=retry_after)
+
+                        if attempt < 2:
+                            logger.warning(f"OpenRouter Stream 429 rate limit [{req_id}], retrying once...")
+                            await asyncio.sleep(1.0)
+                            continue
+                        raise OpenRouterRateLimitError(retry_after=retry_after)
+
+                    if resp.status_code in (500, 502, 503, 504):
+                        if attempt < 2:
+                            logger.warning(f"OpenRouter Stream HTTP {resp.status_code} [{req_id}], retrying once...")
+                            await asyncio.sleep(1.0)
+                            continue
+                        raise OpenRouterServiceError(
+                            f"OpenRouter stream service unavailable (HTTP {resp.status_code}): {err_text[:120]}"
+                        )
+
+                    raise OpenRouterServiceError(f"HTTP {resp.status_code}: {err_text[:120]}")
+
+            except (
+                OpenRouterAuthError,
+                OpenRouterQuotaError,
+                OpenRouterAccountQuotaExhaustedError,
+                OpenRouterRateLimitError,
+                OpenRouterServiceError,
+                KnowledgeBaseException,
+            ):
+                raise
+            except (httpx.TimeoutException, httpx.NetworkError) as net_err:
+                if stream_started:
+                    # NEVER switch providers mid-stream!
+                    logger.error(f"Network error mid-stream on model '{model}' after {tokens_emitted} tokens: {net_err}")
+                    raise OpenRouterServiceError(f"Stream interrupted by network error: {net_err}")
+                if attempt < 2:
+                    logger.warning(f"OpenRouter Stream network error [{req_id}], retrying once: {net_err}")
+                    await asyncio.sleep(1.0)
+                    continue
+                raise OpenRouterServiceError(f"OpenRouter stream network timeout / connection error: {str(net_err)}")
+
+        raise OpenRouterServiceError("OpenRouter failed to start streaming after retries.")

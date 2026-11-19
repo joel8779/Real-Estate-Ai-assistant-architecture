@@ -144,6 +144,22 @@ class ChatResponse(BaseModel):
         default=None,
         description="Identifier of the LLM model that generated this response (primary or fallback)",
     )
+    provider: Optional[Literal["openrouter", "ollama"]] = Field(
+        default="openrouter",
+        description="Active inference provider ('openrouter' or 'ollama')",
+    )
+    fallback_active: bool = Field(
+        default=False,
+        description="Whether secondary local Ollama fallback generated this response",
+    )
+    fallback_reason: Optional[Literal["quota_exhausted", "provider_outage"]] = Field(
+        default=None,
+        description="Trigger classification if secondary fallback was used",
+    )
+    fallback_notice: Optional[str] = Field(
+        default=None,
+        description="User-facing notice explaining fallback activation",
+    )
     disclaimer: str = Field(
         default="Information provided is grounded in available records from DarGlobal and Wasalt. Verify terms, availability, and prices directly with official representatives.",
         description="Standard legal disclaimer",

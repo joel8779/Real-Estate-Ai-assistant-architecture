@@ -158,6 +158,10 @@ export const ChatContainer: React.FC<ChatContainerProps> = ({
                   disclaimer={resp?.disclaimer}
                   isStreaming={isLastStreaming}
                   model={resp?.model}
+                  provider={resp?.provider}
+                  fallbackActive={resp?.fallback_active}
+                  fallbackReason={resp?.fallback_reason}
+                  fallbackNotice={resp?.fallback_notice}
                   onRetry={() => onRetry?.(index)}
                   isRetrying={isRetrying}
                 />

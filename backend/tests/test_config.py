@@ -15,7 +15,25 @@ def test_cors_origins_parsing():
     assert s3.CORS_ORIGINS == ["http://localhost:3000", "http://localhost:5173"]
 
 
-def test_fallback_models_parsing():
-    """Verify fallback models list and string parsing."""
-    s = Settings(OPENROUTER_FALLBACK_MODELS="model-a,model-b")
-    assert s.OPENROUTER_FALLBACK_MODELS == ["model-a", "model-b"]
+def test_ollama_config_defaults_and_overrides():
+    """Verify Ollama settings defaults and custom configuration."""
+    s_default = Settings()
+    assert s_default.OLLAMA_ENABLED is True
+    assert s_default.OLLAMA_BASE_URL == "http://localhost:11434"
+    assert s_default.OLLAMA_MODEL == "qwen2.5:1.5b"
+    assert s_default.OLLAMA_TIMEOUT_SECONDS == 60.0
+    assert s_default.OLLAMA_KEEP_ALIVE == "5m"
+    assert s_default.OPENROUTER_MODEL == "nvidia/nemotron-3-ultra-550b-a55b:free"
+
+    s_custom = Settings(
+        OLLAMA_ENABLED=False,
+        OLLAMA_BASE_URL="http://ollama:11434",
+        OLLAMA_MODEL="qwen2.5:1.5b",
+        OLLAMA_TIMEOUT_SECONDS=30.0,
+        OLLAMA_KEEP_ALIVE="10m",
+    )
+    assert s_custom.OLLAMA_ENABLED is False
+    assert s_custom.OLLAMA_BASE_URL == "http://ollama:11434"
+    assert s_custom.OLLAMA_MODEL == "qwen2.5:1.5b"
+    assert s_custom.OLLAMA_TIMEOUT_SECONDS == 30.0
+    assert s_custom.OLLAMA_KEEP_ALIVE == "10m"

@@ -20,13 +20,20 @@ interface MessageBubbleProps {
   onRetry?: () => void;
   isRetrying?: boolean;
   model?: string;
+  provider?: 'openrouter' | 'ollama';
+  fallbackActive?: boolean;
+  fallbackReason?: 'quota_exhausted' | 'provider_outage';
+  fallbackNotice?: string | null;
 }
 
-const getModelDisplayName = (modelStr?: string): string => {
+const getModelDisplayName = (modelStr?: string, provider?: string): string => {
   if (!modelStr) return 'Nemotron 3 Ultra';
   const lower = modelStr.toLowerCase();
   if (lower.includes('nemotron')) {
     return 'Nemotron 3 Ultra';
+  }
+  if (lower.includes('qwen') || provider === 'ollama') {
+    return 'Local Fallback: Qwen 2.5 1.5B';
   }
   const shortName = modelStr.split('/').pop() || modelStr;
   return `Fallback: ${shortName}`;
@@ -45,6 +52,10 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
   onRetry,
   isRetrying = false,
   model,
+  provider,
+  fallbackActive,
+  fallbackReason,
+  fallbackNotice,
 }) => {
   const isUser = message.role === 'user';
 
@@ -77,12 +88,18 @@ export const MessageBubble: React.FC<MessageBubbleProps> = ({
                 <span
                   data-testid="model-badge"
                   className={`text-[10px] px-1.5 py-0.5 rounded border font-mono ${
-                    model && !model.toLowerCase().includes('nemotron')
+                    fallbackActive || (model && !model.toLowerCase().includes('nemotron'))
                       ? 'bg-amber-500/10 border-amber-500/20 text-amber-300'
                       : 'bg-surface-subtle border-surface-border text-[#A1A1AA]'
                   }`}
+                  title={
+                    fallbackNotice ||
+                    (fallbackActive
+                      ? `Local fallback active: ${fallbackReason === 'quota_exhausted' ? 'Daily quota limit reached' : 'Provider outage'}`
+                      : undefined)
+                  }
                 >
-                  {getModelDisplayName(model)}
+                  {getModelDisplayName(model, provider)}
                 </span>
               )}
             </div>

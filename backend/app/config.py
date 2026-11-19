@@ -41,18 +41,18 @@ class Settings(BaseSettings):
     MAX_REQUEST_SIZE_BYTES: int = Field(default=65536, description="Max 64 KB")
     RATE_LIMIT_PER_MINUTE: int = Field(default=60, description="Max requests/min per IP")
 
-    # OpenRouter LLM Configuration
+    # OpenRouter Primary LLM Configuration
     OPENROUTER_API_KEY: str = Field(default="", description="OpenRouter API Key")
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
     OPENROUTER_MODEL: str = "nvidia/nemotron-3-ultra-550b-a55b:free"
-    OPENROUTER_ALLOW_FALLBACK: bool = Field(
-        default=False,
-        description="Disable automatic fallback by default to prevent silent model switching.",
-    )
-    OPENROUTER_FALLBACK_MODELS: Union[List[str], str] = [
-        "nvidia/nemotron-3.5-lightning:free",
-        "google/gemma-4-26b-a4b-it:free",
-    ]
+
+    # Ollama Secondary Fallback LLM Configuration (Single local/Azure Qwen model)
+    OLLAMA_ENABLED: bool = Field(default=True, description="Enable secondary fallback to Ollama")
+    OLLAMA_BASE_URL: str = Field(default="http://localhost:11434", description="Ollama endpoint URL")
+    OLLAMA_MODEL: str = Field(default="qwen2.5:1.5b", description="Secondary fallback model tag")
+    OLLAMA_TIMEOUT_SECONDS: float = Field(default=60.0, description="Ollama inference timeout in seconds")
+    OLLAMA_KEEP_ALIVE: str = Field(default="5m", description="Ollama memory keep-alive duration")
+
     LLM_TEMPERATURE: float = 0.1
     LLM_MAX_TOKENS: int = 1024
     LLM_TIMEOUT_SECONDS: float = 45.0
@@ -93,22 +93,6 @@ class Settings(BaseSettings):
                     pass
             return [origin.strip() for origin in v.split(",") if origin.strip()]
         return ["*"]
-
-    @field_validator("OPENROUTER_FALLBACK_MODELS", mode="before")
-    @classmethod
-    def parse_fallback_models(cls, v: Union[str, List[str]]) -> List[str]:
-        """Parse fallback models from comma-separated string or JSON list."""
-        if isinstance(v, list):
-            return v
-        if isinstance(v, str):
-            v = v.strip()
-            if v.startswith("[") and v.endswith("]"):
-                try:
-                    return json.loads(v)
-                except Exception:
-                    pass
-            return [m.strip() for m in re.split(r"[,;]", v) if m.strip()]
-        return []
 
 
 @lru_cache()
