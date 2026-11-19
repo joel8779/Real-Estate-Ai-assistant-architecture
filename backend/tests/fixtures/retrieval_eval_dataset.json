@@ -1,0 +1,150 @@
+{
+  "description": "Evaluation benchmark dataset for DarGlobal and Wasalt hybrid retrieval engine.",
+  "total_queries": 16,
+  "test_cases": [
+    {
+      "id": "eval_01",
+      "query": "What is the London Stock Exchange ticker for DarGlobal?",
+      "expected_entity_ids": ["doc_f8e2f6d7c94bd091", "doc_2bdf0f6f3cf24e54"],
+      "expected_source": "darglobal",
+      "category": "company_info",
+      "is_answerable": true,
+      "notes": "DarGlobal corporate listing on LSE under ticker DAR"
+    },
+    {
+      "id": "eval_02",
+      "query": "Which luxury automotive and fashion brand partners does DarGlobal collaborate with?",
+      "expected_entity_ids": ["doc_f8e2f6d7c94bd091"],
+      "expected_source": "darglobal",
+      "category": "company_info",
+      "is_answerable": true,
+      "notes": "Collaborations with Lamborghini, Pagani, Missoni, Elie Saab, Aston Martin, Trump"
+    },
+    {
+      "id": "eval_03",
+      "query": "Tell me about the AIDA development in Muscat Oman and the Trump International Golf Club",
+      "expected_entity_ids": ["doc_cbd31f6f8b850956"],
+      "expected_source": "darglobal",
+      "category": "project",
+      "is_answerable": true,
+      "notes": "AIDA Oman 100m cliffside master development with Trump 18-hole championship course"
+    },
+    {
+      "id": "eval_04",
+      "query": "Where is DaVinci Tower located and what design principles does it use?",
+      "expected_entity_ids": ["doc_9f74f356495b03db"],
+      "expected_source": "darglobal",
+      "category": "project",
+      "is_answerable": true,
+      "notes": "Dubai Water Canal, Horacio Pagani carbon-titanium design principles"
+    },
+    {
+      "id": "eval_05",
+      "query": "What are the villa typologies in Tierra Viva by Automobili Lamborghini in Marbella Spain?",
+      "expected_entity_ids": ["doc_1bd579e448197adb"],
+      "expected_source": "darglobal",
+      "category": "project",
+      "is_answerable": true,
+      "notes": "Diamante (6BR), Zafiro (5BR), and Esmeralda (4BR) villas in Benahavís"
+    },
+    {
+      "id": "eval_06",
+      "query": "What amenities and features are available at Urban Oasis by Missoni in Business Bay?",
+      "expected_entity_ids": ["doc_213a16875616d4d9"],
+      "expected_source": "darglobal",
+      "category": "project",
+      "is_answerable": true,
+      "notes": "Dubai Canal, 34-storey, Missoni zigzag patterns, infinity pool, gym"
+    },
+    {
+      "id": "eval_07",
+      "query": "Can foreigners get a Golden Visa by buying DarGlobal property and what is the minimum investment?",
+      "expected_entity_ids": ["doc_2bdf0f6f3cf24e54"],
+      "expected_source": "darglobal",
+      "category": "faq",
+      "is_answerable": true,
+      "notes": "Golden Visa thresholds such as AED 2,000,000 in UAE and qualifying thresholds in Oman/Spain"
+    },
+    {
+      "id": "eval_08",
+      "query": "How is DarGlobal's installment payment plan structured?",
+      "expected_entity_ids": ["doc_2bdf0f6f3cf24e54"],
+      "expected_source": "darglobal",
+      "category": "faq",
+      "is_answerable": true,
+      "notes": "Construction-linked payment plan with 10% to 20% down payment and milestone payments"
+    },
+    {
+      "id": "eval_09",
+      "query": "What is the price and area of the 3-bedroom apartment for sale in Al-Narjis Riyadh on Wasalt?",
+      "expected_entity_ids": ["doc_1c3070a227c643de"],
+      "expected_source": "wasalt",
+      "category": "listing",
+      "is_answerable": true,
+      "notes": "185 SQM, 850,000 SAR, 3 master bedrooms in Al-Narjis"
+    },
+    {
+      "id": "eval_10",
+      "query": "Find the 5-bedroom villa for sale in Al-Mahdiyah Riyadh with land area and street width",
+      "expected_entity_ids": ["doc_ffd43c3964c41a1a"],
+      "expected_source": "wasalt",
+      "category": "listing",
+      "is_answerable": true,
+      "notes": "333 SQM land, 20m width street, 1,600,000 SAR in Al-Mahdiyah"
+    },
+    {
+      "id": "eval_11",
+      "query": "What is Wasalt Business and what licenses does it verify for Saudi real estate brokers?",
+      "expected_entity_ids": ["doc_a41e7a26e077538b"],
+      "expected_source": "wasalt",
+      "category": "company_info",
+      "is_answerable": true,
+      "notes": "Wasalt Business portal, REGA and Val license compliance"
+    },
+    {
+      "id": "eval_12",
+      "query": "Show me luxury residences developed on the Dubai Canal",
+      "expected_entity_ids": ["doc_9f74f356495b03db", "doc_213a16875616d4d9"],
+      "expected_source": "darglobal",
+      "category": "project",
+      "is_answerable": true,
+      "notes": "DaVinci Tower and Urban Oasis both situated on Dubai Canal"
+    },
+    {
+      "id": "eval_13",
+      "query": "What villas are available across DarGlobal and Wasalt portfolios?",
+      "expected_entity_ids": ["doc_1bd579e448197adb", "doc_ffd43c3964c41a1a", "doc_cbd31f6f8b850956"],
+      "expected_source": "cross_source",
+      "category": "cross_source",
+      "is_answerable": true,
+      "notes": "Tierra Viva Spain, Al-Mahdiyah Riyadh, and AIDA Oman oceanfront villas"
+    },
+    {
+      "id": "eval_14",
+      "query": "Are there any residential properties priced under 1 million SAR?",
+      "expected_entity_ids": ["doc_1c3070a227c643de"],
+      "expected_source": "wasalt",
+      "category": "listing",
+      "is_answerable": true,
+      "notes": "Apartment in Al-Narjis priced at 850,000 SAR"
+    },
+    {
+      "id": "eval_15",
+      "query": "What is the capital of Australia and its GDP growth rate in 2025?",
+      "expected_entity_ids": [],
+      "expected_source": null,
+      "category": "out_of_domain",
+      "is_answerable": false,
+      "notes": "Completely out of domain test query"
+    },
+    {
+      "id": "eval_16",
+      "query": "How much does a DarGlobal 2-bedroom luxury penthouse cost in Tokyo, Japan?",
+      "expected_entity_ids": [],
+      "expected_source": "darglobal",
+      "category": "unanswerable_real_estate",
+      "is_answerable": false,
+      "notes": "DarGlobal has no projects in Tokyo, Japan in the dataset"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "id": "doc_ws_5841667",
+  "source": "wasalt",
+  "url": "https://wasalt.sa/en/property/sale/apartment-with-3-bedrooms-5841667",
+  "title": "Apartment with 3 Bedrooms in Al-Narjis, Riyadh",
+  "content_type": "html",
+  "raw_content": "<!DOCTYPE html><html lang=\"en\"><head><title>Apartment with 3 Bedrooms for Sale in Al-Narjis, Riyadh | Wasalt</title><meta name=\"description\" content=\"3-bedroom apartment for sale in Al-Narjis district, Riyadh. Area: 185 SQM. Price: 850,000 SAR.\"><script type=\"application/ld+json\">{\"@context\":\"https://schema.org\",\"@type\":\"Apartment\",\"name\":\"Apartment with 3 Bedrooms in Al-Narjis, Riyadh\",\"description\":\"<p>Modern luxury apartment in Al-Narjis, North Riyadh.</p><p>Area: 185 SQM</p><p>3 master bedrooms, modern kitchen, smart home system</p><p>Price: 850,000 SAR</p>\",\"numberOfRooms\":\"3\",\"numberOfBedrooms\":\"3\",\"address\":{\"@type\":\"PostalAddress\",\"addressCountry\":\"Saudi Arabia\",\"addressLocality\":\"Riyadh\",\"addressRegion\":\"North Riyadh\",\"streetAddress\":\"Al-Narjis\"},\"offers\":[{\"@type\":\"Offer\",\"price\":850000,\"priceCurrency\":\"SAR\"}]}</script><script id=\"__NEXT_DATA__\" type=\"application/json\">{\"props\":{\"pageProps\":{\"propertyDetailsV3\":{\"id\":\"5841667\",\"location\":{\"lat\":\"24.8112\",\"lon\":\"46.6784\"},\"propertyInfo\":{\"currencyType\":\"SAR\",\"country\":\"Saudi Arabia\",\"propertyMainType\":\"Residential\",\"address\":\"Al-Narjis, North Riyadh, Riyadh\"},\"attributes\":[{\"key\":\"noOfBedrooms\",\"name\":\"Bedrooms\",\"value\":3},{\"key\":\"carpetArea\",\"name\":\"Land Area\",\"value\":\"185\",\"unit\":\"SQM\"}],\"additionalAttributes\":[{\"key\":\"completionYear\",\"label\":\"Age\",\"value\":\"New\"},{\"key\":\"propertyFacade\",\"label\":\"Facade\",\"value\":\"South\"}]}}}}</script></head><body><h1>Apartment with 3 Bedrooms</h1></body></html>",
+  "http_status": 200,
+  "headers": {"content-type": "text/html"}
+}

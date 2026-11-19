@@ -1,0 +1,10 @@
+{
+  "id": "doc_ws_business",
+  "source": "wasalt",
+  "url": "https://wasalt.sa/en/s/wasalt-business",
+  "title": "Wasalt Business Solutions — Saudi Real Estate B2B Platform",
+  "content_type": "html",
+  "raw_content": "<!DOCTYPE html><html lang=\"en\"><head><title>Wasalt Business — Real Estate Agency and Developer Portal</title><meta name=\"description\" content=\"Wasalt Business provides enterprise listing management, CRM, and verified REGA marketing for Saudi agencies and brokers.\"></head><body><h1>Wasalt Business Solutions</h1><p>Wasalt Business is the dedicated enterprise platform connecting Saudi real estate developers, agencies, brokers, and certified property managers.</p><p>Key Business Features:</p><ul><li>REGA (Real Estate General Authority) license verification and authorized advertisement compliance (Val license integration).</li><li>Direct CRM property management and automated syndication across web and mobile applications.</li><li>Verified escrow and E-Wallet payment guarantees for auctions and digital transactions.</li><li>Advanced lead tracking, property analytics, and developer dashboard reporting.</li></ul></body></html>",
+  "http_status": 200,
+  "headers": {"content-type": "text/html"}
+}
